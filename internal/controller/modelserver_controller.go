@@ -135,9 +135,10 @@ func (r *ModelServerReconciler) buildDeployment(ms *servingv1alpha1.ModelServer)
 				ObjectMeta: metav1.ObjectMeta{Labels: labels},
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{{
-						Name:  "server",
-						Image: ms.Spec.Image,
-						Ports: []corev1.ContainerPort{{ContainerPort: 8000}},
+						Name:            "server",
+						Image:           ms.Spec.Image,
+						ImagePullPolicy: corev1.PullIfNotPresent,
+						Ports:           []corev1.ContainerPort{{ContainerPort: 8000}},
 						Env: []corev1.EnvVar{{
 							Name:  "MODEL_NAME",
 							Value: ms.Spec.Model,
