@@ -28,3 +28,7 @@ go.work
 
 # Kubeconfig might contain secrets
 *.kubeconfig
+
+# Personal learning notes and Go scratch files
+docs/
+scripts/

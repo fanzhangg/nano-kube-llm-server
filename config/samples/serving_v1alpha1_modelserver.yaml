@@ -4,6 +4,10 @@ metadata:
   labels:
     app.kubernetes.io/name: nano-kube-llm-server
     app.kubernetes.io/managed-by: kustomize
-  name: modelserver-sample
+  name: qwen-small
 spec:
-  # TODO(user): Add fields here
+  # Model name, passed to the serving container as the MODEL_NAME env var
+  model: "Qwen/Qwen2.5-0.5B-Instruct"
+  replicas: 2
+  # Mock inference server; swap for a real vLLM image once available
+  image: "modelserver-mock:latest"
