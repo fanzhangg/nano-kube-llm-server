@@ -1,0 +1,9 @@
+apiVersion: serving.fanzhangg.dev/v1alpha1
+kind: ModelServer
+metadata:
+  labels:
+    app.kubernetes.io/name: nano-kube-llm-server
+    app.kubernetes.io/managed-by: kustomize
+  name: modelserver-sample
+spec:
+  # TODO(user): Add fields here

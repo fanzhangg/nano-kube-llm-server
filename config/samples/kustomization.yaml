@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- serving_v1alpha1_modelserver.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples
