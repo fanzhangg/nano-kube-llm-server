@@ -35,6 +35,7 @@ var _ = Describe("ModelServer Controller", func() {
 		const (
 			resourceName      = "test-resource"
 			resourceNamespace = "default"
+			resourceModel     = "test-model"
 		)
 
 		ctx := context.Background()
@@ -54,7 +55,9 @@ var _ = Describe("ModelServer Controller", func() {
 						Name:      resourceName,
 						Namespace: resourceNamespace,
 					},
-					// TODO(user): Specify other spec details if needed.
+					Spec: servingv1alpha1.ModelServerSpec{
+						Model: resourceModel,
+					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 			}
