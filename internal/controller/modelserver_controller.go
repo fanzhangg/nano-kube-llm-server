@@ -18,10 +18,12 @@ package controller
 
 import (
 	"context"
+	"fmt"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -88,7 +90,79 @@ func (r *ModelServerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 func (r *ModelServerReconciler) updateStatus(ctx context.Context, ms *servingv1alpha1.ModelServer) error {
-	return nil
+	var deploy appsv1.Deployment
+	err := r.Get(ctx, types.NamespacedName{Name: ms.Name, Namespace: ms.Namespace}, &deploy)
+	if err != nil && !errors.IsNotFound(err) {
+		return err
+	}
+	found := err == nil
+
+	var ready, total int32
+
+	if found {
+		ready = deploy.Status.ReadyReplicas
+		total = deploy.Status.Replicas
+	}
+
+	available := metav1.ConditionFalse
+	availableReason := "DeploymentNotFound"
+
+	if found {
+		if ready >= ms.Spec.Replicas {
+			available = metav1.ConditionTrue
+			availableReason = "AllReplicasReady"
+		} else {
+			availableReason = "ReplicasNotReady"
+		}
+	}
+
+	changed := meta.SetStatusCondition(&ms.Status.Conditions, metav1.Condition{
+		Type:    servingv1alpha1.ConditionTypeAvailable,
+		Status:  available,
+		Reason:  availableReason,
+		Message: fmt.Sprintf("%d/%d replicas ready", ready, ms.Spec.Replicas),
+	})
+
+	progressing := metav1.ConditionTrue
+	progressingReason := "Reconciling"
+	if available == metav1.ConditionTrue {
+		progressing = metav1.ConditionFalse
+		progressingReason = "AllReplicasReady"
+	}
+
+	if meta.SetStatusCondition(&ms.Status.Conditions, metav1.Condition{
+		Type:   servingv1alpha1.ConditionTypeProgressing,
+		Status: progressing,
+		Reason: progressingReason,
+	}) {
+		changed = true
+	}
+
+	phase := "Loading"
+	switch {
+	case !found || total == 0:
+		phase = "Pending"
+	case available == metav1.ConditionTrue:
+		phase = "Ready"
+	}
+	if ms.Status.Phase != phase {
+		ms.Status.Phase = phase
+		changed = true
+	}
+	if ms.Status.ReadyReplicas != ready {
+		ms.Status.ReadyReplicas = ready
+		changed = true
+	}
+	if ms.Status.ObservedGeneration != ms.Generation {
+		ms.Status.ObservedGeneration = ms.Generation
+		changed = true
+	}
+
+	if !changed {
+		return nil
+	}
+
+	return r.Status().Update(ctx, ms)
 }
 
 func (r *ModelServerReconciler) reconcileDeployment(ctx context.Context, ms *servingv1alpha1.ModelServer) error {
