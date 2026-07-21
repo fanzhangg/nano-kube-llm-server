@@ -261,7 +261,10 @@ def complete(
     """Blocking one-shot completion. main.py calls this via asyncio.to_thread so
     the CPU-bound forward passes never stall the event loop."""
     ids = _prompt_ids(tokenizer, prompt)
-    idx = torch.tensor([ids], dtype=torch.long)
+    # Build the input on whatever device the model lives on -- inputs and params
+    # must match, and inferring from the model keeps callers device-agnostic.
+    device = next(model.parameters()).device
+    idx = torch.tensor([ids], dtype=torch.long, device=device)
     out = model.generate(idx, max_new_tokens, temperature, top_k)
     return tokenizer.decode(out[0, len(ids):].tolist())
 
@@ -276,6 +279,7 @@ def complete_stream(
 ):
     """Blocking generator yielding decoded text piece by piece (one char/token each)."""
     ids = _prompt_ids(tokenizer, prompt)
-    idx = torch.tensor([ids], dtype=torch.long)
+    device = next(model.parameters()).device
+    idx = torch.tensor([ids], dtype=torch.long, device=device)
     for token_id in model.generate_stream(idx, max_new_tokens, temperature, top_k):
         yield tokenizer.decode([token_id])

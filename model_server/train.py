@@ -63,13 +63,19 @@ def train_step(
 
 @torch.no_grad()
 def estimate_loss(
-    model: NanoGPT, data: torch.Tensor, block_size: int, batch_size: int, iters: int = 40
+    model: NanoGPT,
+    data: torch.Tensor,
+    block_size: int,
+    batch_size: int,
+    iters: int = 40,
+    device: str = "cpu",
 ) -> float:
     """Average loss over several random batches -- one batch is too noisy to read."""
     model.eval()
     total = 0.0
     for _ in range(iters):
         x, y = get_batch(data, block_size, batch_size)
+        x, y = x.to(device), y.to(device)   # batches must match the model's device
         _, loss = model(x, y)
         total += loss.item()
     model.train()
@@ -91,6 +97,8 @@ def main() -> None:
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"device: {device}")
 
     if args.sample_only:
         model, tokenizer = load_model(CKPT_PATH)
@@ -113,7 +121,7 @@ def main() -> None:
         n_head=args.n_head,
         n_embd=args.n_embd,
     )
-    model = NanoGPT(cfg)
+    model = NanoGPT(cfg).to(device)
     n_params = sum(param.numel() for param in model.parameters())
     print(f"model: {n_params / 1e6:.2f}M params")
 
@@ -122,9 +130,10 @@ def main() -> None:
     started = time.time()
     for step in range(1, args.iters + 1):
         x, y = get_batch(train_data, args.block_size, args.batch_size)
+        x, y = x.to(device), y.to(device)
         loss = train_step(model, optimizer, x, y)
         if step % args.eval_interval == 0 or step == args.iters:
-            val = estimate_loss(model, val_data, args.block_size, args.batch_size)
+            val = estimate_loss(model, val_data, args.block_size, args.batch_size, device=device)
             print(
                 f"step {step:5d}  train_loss {loss:.3f}  val_loss {val:.3f}  "
                 f"({time.time() - started:.0f}s)"
