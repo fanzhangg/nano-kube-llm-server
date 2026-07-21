@@ -172,22 +172,7 @@ func (r *ModelServerReconciler) reconcileDeployment(ctx context.Context, ms *ser
 		return err
 	}
 
-	var existing appsv1.Deployment
-	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, &existing)
-
-	// Create the model server if it does not exist
-	if errors.IsNotFound(err) {
-		return r.Create(ctx, desired)
-	}
-
-	if err != nil {
-		return err
-	}
-
-	existing.Spec.Replicas = desired.Spec.Replicas
-	existing.Spec.Template.Spec.Containers = desired.Spec.Template.Spec.Containers
-
-	return r.Update(ctx, &existing)
+	return r.Patch(ctx, desired, client.Apply, client.FieldOwner("modelserver-controller"), client.ForceOwnership)
 }
 
 func (r *ModelServerReconciler) buildDeployment(ms *servingv1alpha1.ModelServer) *appsv1.Deployment {
@@ -198,6 +183,7 @@ func (r *ModelServerReconciler) buildDeployment(ms *servingv1alpha1.ModelServer)
 	replicas := ms.Spec.Replicas
 
 	return &appsv1.Deployment{
+		TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      ms.Name,
 			Namespace: ms.Namespace,
