@@ -3,3 +3,7 @@ uvicorn
 pytest
 httpx
 openai
+# Milestone 2 (nano-GPT): CPU wheel is enough; the extra index makes pip prefer
+# the +cpu build over the multi-GB CUDA build from PyPI.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch

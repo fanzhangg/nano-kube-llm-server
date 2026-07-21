@@ -36,3 +36,7 @@ scripts/
 # Python bytecode/cache (model_server/)
 __pycache__/
 *.py[cod]
+
+# nano-GPT training artifacts (model_server/): corpus download and checkpoints
+model_server/data/
+model_server/checkpoints/
