@@ -6,8 +6,9 @@ Usage:
     python train.py --iters 500         # quick smoke run
     python train.py --sample-only       # load existing checkpoint and print a sample
 
-Milestone 2 skeleton: get_batch() and train_step() are TODO -- the harness around
-them (data download, eval loop, checkpointing, sampling) is given.
+The core loop is get_batch() (random windows, target = input shifted by one) and
+train_step() (forward -> zero_grad -> backward -> step); the harness around them
+handles data download, eval loop, checkpointing, and sampling.
 """
 
 import argparse
@@ -44,22 +45,20 @@ def get_batch(
     the target is data[i+1 : i+block_size+1] -- the model learns "given everything
     so far, predict the NEXT char" at every position simultaneously.
     """
-    # TODO(Day 6):
-    #   1. draw batch_size random start offsets in [0, len(data) - block_size - 1)
-    #      (torch.randint)
-    #   2. x = stack of data[i : i+block_size] slices        -> (batch_size, block_size)
-    #   3. y = stack of data[i+1 : i+block_size+1] slices    -> same shape
-    raise NotImplementedError
-
+    ix = torch.randint(len(data) - block_size - 1, (batch_size,))   # random start offsets
+    x = torch.stack([data[i: i + block_size] for i in ix])
+    y = torch.stack([data[i + 1: i + block_size + 1] for i in ix])  # target = input shifted by 1
+    return x, y
 
 def train_step(
     model: NanoGPT, optimizer: torch.optim.Optimizer, x: torch.Tensor, y: torch.Tensor
 ) -> float:
     """One optimization step. Returns the loss as a float."""
-    # TODO(Day 6): the classic four lines --
-    #   forward (model(x, y) returns (logits, loss)), zero_grad(set_to_none=True),
-    #   backward, optimizer.step(). Return loss.item().
-    raise NotImplementedError
+    _, loss = model(x, y)
+    optimizer.zero_grad(set_to_none=True)   # clear the gradient of last step
+    loss.backward() # back propagation
+    optimizer.step()    # update the parameter with gradient descent
+    return loss.item()
 
 
 @torch.no_grad()
