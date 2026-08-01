@@ -3,13 +3,13 @@ import json
 import os
 import time
 import uuid
-from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
 from fastapi import FastAPI, Response
 from fastapi.responses import StreamingResponse
+
+from engines import MockEngine, NanoGPTEngine, QwenEngine, load_nanogpt, load_qwen
 
 
 @dataclass
@@ -27,116 +27,10 @@ class Settings:
     max_concurrency: int = field(
         default_factory=lambda: int(os.environ.get("MAX_CONCURRENCY", "4"))
     )
-
-@dataclass
-class Completion:
-    """What an Engine returns: the generated text plus honest token counts. The
-    engine owns tokenization, so it's the only thing that can count truthfully --
-    the HTTP layer just copies these into the usage block."""
-
-    text: str
-    prompt_tokens: int
-    completion_tokens: int
-
-
-class Engine(ABC):
-    """The inference boundary. HTTP handlers depend on THIS, never on torch or
-    nanogpt directly. Swapping nano-GPT for vLLM later means writing a new Engine
-    implementation, not touching a single handler. The server owns concurrency
-    accounting (the _slot semaphore); the engine owns only "how to generate"."""
-
-    @abstractmethod
-    async def generate(
-        self, prompt: str, max_tokens: int, temperature: float, top_k: int | None
-    ) -> Completion:
-        """One-shot completion."""
-
-    @abstractmethod
-    def stream(
-        self, prompt: str, max_tokens: int, temperature: float, top_k: int | None
-    ) -> AsyncIterator[str]:
-        """Async generator yielding decoded text pieces, one decode step at a time."""
-
-
-class MockEngine(Engine):
-    """Fakes prefill+decode latency and returns placeholder text. Used whenever no
-    checkpoint is configured, so the server still behaves exactly as the Milestone 1
-    mock -- existing tests and old images keep working (graceful degradation)."""
-
-    def __init__(self, model_name: str):
-        self.model_name = model_name
-
-    @staticmethod
-    def _latency(prompt: str, max_tokens: int) -> float:
-        return len(prompt) * 0.001 + max_tokens * 0.02
-
-    @staticmethod
-    def _text(max_tokens: int) -> str:
-        return f"[mock output of {max_tokens} tokens]"
-
-    async def generate(self, prompt, max_tokens, temperature, top_k) -> Completion:
-        await asyncio.sleep(self._latency(prompt, max_tokens))
-        return Completion(
-            text=self._text(max_tokens),
-            prompt_tokens=len(prompt),
-            completion_tokens=max_tokens,
-        )
-
-    async def stream(self, prompt, max_tokens, temperature, top_k):
-        latency = self._latency(prompt, max_tokens)
-        pieces = self._text(max_tokens).split(" ")
-        per_piece = latency / max(len(pieces), 1)
-        for piece in pieces:
-            await asyncio.sleep(per_piece)
-            yield piece + " "
-
-
-class NanoGPTEngine(Engine):
-    """Real inference over a trained nano-GPT checkpoint. All torch/nanogpt
-    dependencies live behind this boundary. CPU/GPU-bound generation is pushed off
-    the event loop with asyncio.to_thread so /health and /metrics stay responsive
-    while a completion is running."""
-
-    def __init__(self, model, tokenizer):
-        self.model, self.tokenizer = model, tokenizer
-
-    async def generate(self, prompt, max_tokens, temperature, top_k) -> Completion:
-        from nanogpt import complete
-
-        text = await asyncio.to_thread(
-            complete, self.model, self.tokenizer, prompt, max_tokens, temperature, top_k
-        )
-        # Token counts come from the tokenizer, not from len(text) or max_tokens --
-        # this is the usage block finally telling the truth.
-        return Completion(
-            text=text,
-            prompt_tokens=len(self.tokenizer.encode(prompt)),
-            completion_tokens=len(self.tokenizer.encode(text)),
-        )
-
-    async def stream(self, prompt, max_tokens, temperature, top_k):
-        from nanogpt import complete_stream
-
-        gen = complete_stream(
-            self.model, self.tokenizer, prompt, max_tokens, temperature, top_k
-        )
-        # complete_stream is a blocking generator -- each next() is one real forward
-        # pass. Pull items one at a time via to_thread so the event loop stays free
-        # between decode steps. The sentinel marks exhaustion (avoids raising
-        # StopIteration across a coroutine boundary, which asyncio mangles).
-        done = object()
-        while True:
-            piece = await asyncio.to_thread(next, gen, done)
-            if not isinstance(piece, str):  # the sentinel -> generator is exhausted
-                break
-            yield piece
-
-
-def _load_real_model(path):
-    from nanogpt import load_model
-
-    return load_model(path)
-
+    model_id: str = field(default_factory=lambda: os.environ.get("MODEL_ID", ""))
+    enable_thinking: bool = field(
+        default_factory=lambda: os.environ.get("ENABLE_THINKING", "").lower() == "true"
+    )
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     # Factory instead of a module-level app: each call gets its own Settings, its own
@@ -149,9 +43,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         async def _load():
-            if settings.checkpoint_path:
+            # Whichever backend is configured wins, most capable first. No fourth
+            # env var to keep in sync -- configuring a model IS the selection.
+            if settings.model_id:
+                model, tokenizer = await asyncio.to_thread(load_qwen, settings.model_id)
+                app.state.engine = QwenEngine(model, tokenizer, settings.enable_thinking)
+            elif settings.checkpoint_path:
                 model, tokenizer = await asyncio.to_thread(
-                    _load_real_model, settings.checkpoint_path
+                    load_nanogpt, settings.checkpoint_path
                 )
                 app.state.engine = NanoGPTEngine(model, tokenizer)
             # Keep the sleep even for a real checkpoint: loading a 3MB nano-GPT is
@@ -249,7 +148,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "text": result.text,
                     "index": 0,
                     "logprobs": None,
-                    "finish_reason": "length",
+                    "finish_reason": result.finish_reason,
                 }
             ],
             "usage": {
