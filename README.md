@@ -2,7 +2,7 @@
 
 A Kubernetes controller for declarative LLM inference serving, with model-loading-aware status reporting.
 
-A toy project built to learn the Kubernetes operator pattern from scratch — CRDs, reconciliation loops, owner references, and status subresources.
+A toy project built to learn the Kubernetes operator pattern from scratch — CRDs, reconciliation loops, owner references, and status subresources — paired with an inference server written from scratch alongside it, so both halves of "serving an LLM on Kubernetes" are real rather than mocked.
 
 ## Why not just use a Deployment?
 
@@ -23,7 +23,7 @@ flowchart TD
     user(["kubectl apply"])
 
     subgraph declared["What you declare"]
-        cr["<b>ModelServer</b> (CR)<br/>spec.model<br/>spec.replicas<br/>spec.image"]
+        cr["<b>ModelServer</b> (CR)<br/>spec.model<br/>spec.replicas<br/>spec.image<br/>spec.gpus"]
     end
 
     ctrl{{"<b>ModelServer Controller</b><br/>reconcile loop"}}
@@ -62,9 +62,11 @@ Early development. Built incrementally as a learning exercise.
 | Reconcile → owned `Deployment` + `Service` | ✅ |
 | Owner references + cascading garbage collection | ✅ |
 | Drift correction (external changes reverted) | ✅ |
-| Status fields defined (conditions, phase, observedGeneration) | ✅ |
-| Status reporting (`Pending → Loading → Ready`) | 🚧 not yet populated |
-| Mock inference server | 🚧 |
+| Status reporting (`Pending → Loading → Ready`) | ✅ |
+| Mock inference server (OpenAI-compatible, vLLM-style metrics) | ✅ |
+| Real inference — nano-GPT and Qwen3 behind a swappable `Engine` | ✅ |
+| GPU scheduling via `spec.gpus` | ✅ |
+| Continuous batching | 🚧 in progress |
 | Graceful drain | ⬜ planned |
 | LLM-aware autoscaling | ⬜ planned |
 
@@ -74,14 +76,19 @@ Early development. Built incrementally as a learning exercise.
 apiVersion: serving.fanzhangg.dev/v1alpha1
 kind: ModelServer
 metadata:
-  name: qwen-small
+  name: qwen3-06b
 spec:
-  model: "Qwen/Qwen2.5-0.5B-Instruct"   # passed to the container as MODEL_NAME
-  replicas: 2
-  image: "modelserver-mock:latest"
+  model: "Qwen/Qwen3-0.6B"          # HuggingFace repo id — also selects the engine
+  replicas: 1
+  image: "modelserver-qwen:latest"
+  gpus: 0                           # 0 = CPU; 1+ requires the NVIDIA device plugin
 ```
 
+`spec.model` reaches the pod as both `MODEL_ID` and `MODEL_NAME`, and is what makes the server load real weights — so it must be a genuine HuggingFace repo id, paired with an image that ships the runtime to load it. (A `mock/` prefix asks for the mock engine instead, which is how the no-model demo image is driven.)
+
 Status follows Kubernetes API conventions: `conditions` (`Available`, `Progressing`) are the authoritative source of truth, while `phase` is a derived, display-only projection for `kubectl get`.
+
+The server exposes an OpenAI-compatible `/v1/completions` (streaming supported), a `/health` endpoint that returns 503 until the model is loaded, and `/metrics` with vLLM-style `num_requests_running` / `num_requests_waiting` gauges.
 
 ## Quickstart
 
@@ -98,34 +105,79 @@ make install
 make run
 ```
 
-In another terminal:
+In another terminal, build the serving image and load it into the cluster. Qwen3-0.6B's weights are baked in at build time, so the pod never touches the network — the first build takes a few minutes and downloads ~1.2GB:
 
 ```bash
-kubectl apply -f config/samples/serving_v1alpha1_modelserver.yaml
-kubectl get modelserver,deploy,svc,pod
+cd model_server
+docker build -f Dockerfile.qwen -t modelserver-qwen:latest .   # CPU build, ~2.7GB
+kind load docker-image modelserver-qwen:latest --name nano-kube-llm
 ```
+
+Create the `ModelServer` and watch it come up:
+
+```bash
+kubectl apply -f ../config/samples/serving_v1alpha1_modelserver_qwen3.yaml
+kubectl get modelserver qwen3-06b -w
+```
+
+```
+NAME        PHASE     READY
+qwen3-06b   Pending   0
+qwen3-06b   Loading   0
+qwen3-06b   Ready     1
+```
+
+`Loading` is the phase this project exists for: the container is running, but `/health` returns 503 while the weights load, so Kubernetes keeps the pod out of the Service's endpoints and no request is routed to it.
+
+Once it reports `Ready`:
+
+```bash
+kubectl port-forward svc/qwen3-06b 8000:8000
+
+curl -s localhost:8000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt": "What is Kubernetes?", "max_tokens": 64}'
+```
+
+Add `"stream": true` for server-sent events. On CPU expect single-digit tokens/sec — slow, but every part of the control loop behaves identically.
+
+### On a GPU cluster
+
+Build `Dockerfile.qwen-gpu` instead and set `gpus: 1` on the CR. The node needs an NVIDIA driver, the container toolkit, and the device plugin DaemonSet; the image carries everything above the driver.
+
+### Without a model
+
+`config/samples/serving_v1alpha1_modelserver.yaml` uses a `mock/` model and a ~150MB image with no weights. Nothing about the control loop — phases, owner refs, readiness gating, queue-depth metrics — needs real inference, so it is the faster loop for controller work.
 
 ## Development
 
 ```bash
 make manifests    # regenerate CRDs and RBAC from Go markers
 make generate     # regenerate deepcopy code
-make test         # run tests
+make test         # run controller tests (envtest)
 make lint         # run golangci-lint
+```
+
+The inference server is a separate Python project under [`model_server/`](model_server/):
+
+```bash
+cd model_server
+uv run pytest             # server + engine tests
+uv run python bench.py    # prefill/decode benchmark (needs a GPU)
 ```
 
 Deploy the controller into the cluster as a pod (instead of `make run`):
 
 ```bash
-make docker-build IMG=nano-kube-llm-server:v0.1
-kind load docker-image nano-kube-llm-server:v0.1 --name nano-kube-llm
-make deploy IMG=nano-kube-llm-server:v0.1
+make docker-build IMG=modelserver-controller:v0.1
+kind load docker-image modelserver-controller:v0.1 --name nano-kube-llm
+make deploy IMG=modelserver-controller:v0.1
 ```
 
 ## Roadmap
 
-1. **Graceful drain** — finalizers + preStop hooks; wait for in-flight requests to complete before terminating a pod during scale-down or rolling update
-2. **Real vLLM backend** — the mock server's API surface and metric names already mirror vLLM, so this is mostly an image swap
+1. **Continuous batching** — one scheduler loop serving many concurrent requests, so weight reads amortize across sequences instead of one forward pass per request
+2. **Graceful drain** — finalizers + preStop hooks; wait for in-flight requests to complete before terminating a pod during scale-down or rolling update
 3. **Custom autoscaler** — reconcile against `vllm:num_requests_waiting` with cooldown, rather than CPU-based HPA
 4. **Scale testing** — validate controller behavior with hundreds of `ModelServer` objects using kwok
 
