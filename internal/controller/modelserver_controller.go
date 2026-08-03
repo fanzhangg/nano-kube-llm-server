@@ -24,16 +24,25 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	appsv1ac "k8s.io/client-go/applyconfigurations/apps/v1"
+	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
+	metav1ac "k8s.io/client-go/applyconfigurations/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	servingv1alpha1 "github.com/fanzhangg/nano-kube-llm-server/api/v1alpha1"
 )
+
+// gpuResourceName is the extended resource advertised by the NVIDIA device
+// plugin. Scheduling a pod that requests it fails unless that plugin is running
+// on the cluster, which is why spec.gpus defaults to 0.
+const gpuResourceName corev1.ResourceName = "nvidia.com/gpu"
 
 // ModelServerReconciler reconciles a ModelServer object
 type ModelServerReconciler struct {
@@ -168,88 +177,106 @@ func (r *ModelServerReconciler) updateStatus(ctx context.Context, ms *servingv1a
 func (r *ModelServerReconciler) reconcileDeployment(ctx context.Context, ms *servingv1alpha1.ModelServer) error {
 	desired := r.buildDeployment(ms)
 
-	if err := ctrl.SetControllerReference(ms, desired, r.Scheme); err != nil {
-		return err
-	}
-
-	return r.Patch(ctx, desired, client.Apply, client.FieldOwner("modelserver-controller"), client.ForceOwnership)
+	return r.Apply(ctx, desired, client.FieldOwner("modelserver-controller"), client.ForceOwnership)
 }
 
-func (r *ModelServerReconciler) buildDeployment(ms *servingv1alpha1.ModelServer) *appsv1.Deployment {
+// ownerRef builds the controller reference stamped on every object this
+// reconciler owns, so deleting the ModelServer garbage-collects them.
+//
+// ctrl.SetControllerReference cannot be used here: it takes a metav1.Object, and
+// an apply configuration is not one. Hand-building it is the documented way to
+// express ownership when using server-side apply.
+func ownerRef(ms *servingv1alpha1.ModelServer) *metav1ac.OwnerReferenceApplyConfiguration {
+	return metav1ac.OwnerReference().
+		WithAPIVersion(servingv1alpha1.GroupVersion.String()).
+		WithKind("ModelServer").
+		WithName(ms.Name).
+		WithUID(ms.UID).
+		WithController(true).
+		WithBlockOwnerDeletion(true)
+}
+
+func (r *ModelServerReconciler) buildDeployment(ms *servingv1alpha1.ModelServer) *appsv1ac.DeploymentApplyConfiguration {
 	labels := map[string]string{
 		"app":                            "modelserver",
 		"serving.fanzhangg.dev/instance": ms.Name,
 	}
-	replicas := ms.Spec.Replicas
 
-	return &appsv1.Deployment{
-		TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      ms.Name,
-			Namespace: ms.Namespace,
-		},
-		Spec: appsv1.DeploymentSpec{
-			Replicas: &replicas,
-			Selector: &metav1.LabelSelector{MatchLabels: labels},
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: labels},
-				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{{
-						Name:            "server",
-						Image:           ms.Spec.Image,
-						ImagePullPolicy: corev1.PullIfNotPresent,
-						Ports:           []corev1.ContainerPort{{ContainerPort: 8000}},
-						Env: []corev1.EnvVar{{
-							Name:  "MODEL_NAME",
-							Value: ms.Spec.Model,
-						}},
+	container := corev1ac.Container().
+		WithName("server").
+		WithImage(ms.Spec.Image).
+		WithImagePullPolicy(corev1.PullIfNotPresent).
+		WithPorts(corev1ac.ContainerPort().WithContainerPort(8000)).
+		// MODEL_ID is what makes the server load real weights; MODEL_NAME is only
+		// the reported label. Both come from spec.model: configuring a model is
+		// what selects the engine, so there is no separate switch to keep in sync.
+		WithEnv(
+			corev1ac.EnvVar().WithName("MODEL_ID").WithValue(ms.Spec.Model),
+			corev1ac.EnvVar().WithName("MODEL_NAME").WithValue(ms.Spec.Model),
+		).
+		WithReadinessProbe(corev1ac.Probe().
+			WithHTTPGet(corev1ac.HTTPGetAction().
+				WithPath("/health").
+				WithPort(intstr.FromInt(8000))).
+			WithInitialDelaySeconds(5).
+			WithPeriodSeconds(3))
 
-						ReadinessProbe: &corev1.Probe{
-							ProbeHandler: corev1.ProbeHandler{
-								HTTPGet: &corev1.HTTPGetAction{
-									Path: "/health",
-									Port: intstr.FromInt(8000),
-								},
-							},
-							InitialDelaySeconds: 5,
-							PeriodSeconds:       3,
-						},
-					}},
-				},
-			},
-		},
+	// Only set resources when GPUs are actually requested: an empty ResourceList
+	// on a CPU-only cluster is noise, and nvidia.com/gpu is meaningless without
+	// the NVIDIA device plugin installed.
+	if ms.Spec.GPUs > 0 {
+		container = container.WithResources(corev1ac.ResourceRequirements().
+			WithLimits(corev1.ResourceList{
+				gpuResourceName: *resource.NewQuantity(int64(ms.Spec.GPUs), resource.DecimalSI),
+			}))
 	}
+
+	return appsv1ac.Deployment(ms.Name, ms.Namespace).
+		WithOwnerReferences(ownerRef(ms)).
+		WithSpec(appsv1ac.DeploymentSpec().
+			WithReplicas(ms.Spec.Replicas).
+			WithSelector(metav1ac.LabelSelector().WithMatchLabels(labels)).
+			WithTemplate(corev1ac.PodTemplateSpec().
+				WithLabels(labels).
+				WithSpec(corev1ac.PodSpec().
+					WithContainers(container))))
 }
 
+// reconcileService applies the Service, matching reconcileDeployment.
+//
+// The previous version was create-if-missing: once the Service existed it
+// returned nil without comparing anything, so edits to the port or the selector
+// were never corrected. Apply fixes that and removes the Get/IsNotFound/Create
+// branching, since apply is create-or-update by nature.
+//
+// Not setting spec.clusterIP is deliberate rather than an omission. It is
+// assigned by the API server and immutable, so a read-modify-write reconcile has
+// to copy it off the existing object or every update is rejected with
+// "spec.clusterIP: Invalid value: \"\": field is immutable". Under server-side
+// apply the controller simply never claims the field, and the API server keeps
+// its value. Same reasoning covers nodePort and ipFamilies if the type ever
+// changes: list only what this controller means to own.
+//
+// Known limit, verified by the drift tests: spec.ports is a list-map keyed on
+// (port, protocol), so apply corrects drift WITHIN the {port: 8000} entry it
+// owns (targetPort, name, ...) but cannot delete an entry a different field
+// manager added. Someone editing the port number to 9999 leaves a Service with
+// both ports -- and since a multi-port Service requires names, every subsequent
+// apply then fails validation with `spec.ports[1].name: Required value`, so the
+// controller wedges until a human removes the stray port. ForceOwnership does
+// not help: it resolves conflicts over the SAME field, and these are different
+// list entries. Fixing it properly means owning the list atomically, which SSA
+// does not offer for built-in types.
 func (r *ModelServerReconciler) reconcileService(ctx context.Context, ms *servingv1alpha1.ModelServer) error {
-	svc := &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      ms.Name,
-			Namespace: ms.Namespace,
-		},
-		Spec: corev1.ServiceSpec{
-			Selector: map[string]string{
+	desired := corev1ac.Service(ms.Name, ms.Namespace).
+		WithOwnerReferences(ownerRef(ms)).
+		WithSpec(corev1ac.ServiceSpec().
+			WithSelector(map[string]string{
 				"serving.fanzhangg.dev/instance": ms.Name,
-			},
-			Ports: []corev1.ServicePort{{
-				Port:       8000,
-				TargetPort: intstr.FromInt(8000),
-			}},
-		},
-	}
+			}).
+			WithPorts(corev1ac.ServicePort().
+				WithPort(8000).
+				WithTargetPort(intstr.FromInt(8000))))
 
-	if err := ctrl.SetControllerReference(ms, svc, r.Scheme); err != nil {
-		return err
-	}
-
-	var existing corev1.Service
-	err := r.Get(ctx, types.NamespacedName{Name: svc.Name, Namespace: svc.Namespace}, &existing)
-	if errors.IsNotFound(err) {
-		return r.Create(ctx, svc)
-	}
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return r.Apply(ctx, desired, client.FieldOwner("modelserver-controller"), client.ForceOwnership)
 }

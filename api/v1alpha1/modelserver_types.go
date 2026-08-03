@@ -31,6 +31,9 @@ type ModelServerSpec struct {
 	// The following markers will use OpenAPI v3 schema to validate the value
 	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
 
+	// model is the HuggingFace repo id to serve, e.g. "Qwen/Qwen3-0.6B". It is
+	// passed to the pod as both MODEL_ID (which selects the real engine) and
+	// MODEL_NAME (the label reported in /metrics and completion responses).
 	// +kubebuilder:validation:MinLength=1
 	Model string `json:"model"`
 
@@ -40,6 +43,17 @@ type ModelServerSpec struct {
 
 	// +kubebuilder:default="modelserver-mock:latest"
 	Image string `json:"image,omitempty"`
+
+	// gpus requests whole NVIDIA GPUs for each replica. Zero (the default) runs
+	// on CPU, which is slower but needs no device plugin -- every part of the
+	// control loop this operator implements works identically either way.
+	//
+	// Set only as a limit: nvidia.com/gpu is a non-overcommittable extended
+	// resource, so Kubernetes requires requests and limits to match and rejects
+	// specifying them separately.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	GPUs int32 `json:"gpus,omitempty"`
 }
 
 // ModelServerStatus defines the observed state of ModelServer.

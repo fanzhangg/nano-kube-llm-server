@@ -23,8 +23,11 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -189,6 +192,126 @@ var _ = Describe("ModelServer Controller", func() {
 		It("tracks ObservedGeneration", func() {
 			ms := doReconcile()
 			Expect(ms.Status.ObservedGeneration).To(Equal(ms.Generation))
+		})
+	})
+
+	// The Day 4 exercise, as a test: someone bypasses the controller and edits an
+	// owned object directly. Before reconcileService used server-side apply it was
+	// create-if-missing -- it returned nil the moment the Service existed, so none
+	// of these would have been corrected.
+	Context("When an owned object is edited out of band", func() {
+		const (
+			resourceName      = "drift-test-resource"
+			resourceNamespace = "default"
+		)
+
+		ctx := context.Background()
+		typeNamespacedName := types.NamespacedName{Name: resourceName, Namespace: resourceNamespace}
+		var reconciler *ModelServerReconciler
+
+		reconcileOnce := func() {
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+		}
+
+		getService := func() corev1.Service {
+			var svc corev1.Service
+			Expect(k8sClient.Get(ctx, typeNamespacedName, &svc)).To(Succeed())
+			return svc
+		}
+
+		BeforeEach(func() {
+			resource := &servingv1alpha1.ModelServer{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: resourceNamespace},
+				Spec: servingv1alpha1.ModelServerSpec{
+					Model:    "drift-test-model",
+					Replicas: 1,
+				},
+			}
+			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+			reconciler = &ModelServerReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+			reconcileOnce() // creates the Deployment and the Service
+		})
+
+		AfterEach(func() {
+			resource := &servingv1alpha1.ModelServer{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, resource)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+
+			// envtest runs kube-apiserver + etcd only -- there is no
+			// garbage collector, so owner references do NOT cascade here.
+			// Without deleting the owned objects explicitly, the next spec
+			// reconciles on top of this spec's drifted Service.
+			Expect(client.IgnoreNotFound(
+				k8sClient.Delete(ctx, &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+					Name: resourceName, Namespace: resourceNamespace}}))).To(Succeed())
+			Expect(client.IgnoreNotFound(
+				k8sClient.Delete(ctx, &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
+					Name: resourceName, Namespace: resourceNamespace}}))).To(Succeed())
+		})
+
+		It("restores a Service selector that was edited away", func() {
+			svc := getService()
+			Expect(svc.Spec.Selector).To(HaveKeyWithValue("serving.fanzhangg.dev/instance", resourceName))
+
+			svc.Spec.Selector = map[string]string{"serving.fanzhangg.dev/instance": "someone-elses-pods"}
+			Expect(k8sClient.Update(ctx, &svc)).To(Succeed())
+
+			reconcileOnce()
+			Expect(getService().Spec.Selector).
+				To(HaveKeyWithValue("serving.fanzhangg.dev/instance", resourceName))
+		})
+
+		// Drift WITHIN a list entry the controller owns. spec.ports is a
+		// list-map keyed on (port, protocol), so retargeting port 8000 is a
+		// genuine field-level conflict on an entry this controller declared,
+		// and ForceOwnership resolves it in the controller's favour.
+		//
+		// Note the deliberate choice of targetPort over port. Editing the port
+		// NUMBER changes the merge key, so SSA treats it as a different entry:
+		// the controller re-adds its own {port: 8000} but cannot remove the
+		// {port: 9999} another manager owns, and the Service ends up with both.
+		// That is inherent to server-side apply, not something this controller
+		// can fix -- see the note in reconcileService.
+		It("restores a Service targetPort that was edited away", func() {
+			svc := getService()
+			Expect(svc.Spec.Ports).To(HaveLen(1))
+			Expect(svc.Spec.Ports[0].TargetPort).To(Equal(intstr.FromInt(8000)))
+
+			svc.Spec.Ports[0].TargetPort = intstr.FromInt(1234)
+			Expect(k8sClient.Update(ctx, &svc)).To(Succeed())
+
+			reconcileOnce()
+
+			ports := getService().Spec.Ports
+			Expect(ports).To(HaveLen(1))
+			Expect(ports[0].Port).To(Equal(int32(8000)))
+			Expect(ports[0].TargetPort).To(Equal(intstr.FromInt(8000)))
+		})
+
+		It("leaves the API-server-assigned clusterIP alone", func() {
+			original := getService().Spec.ClusterIP
+			Expect(original).NotTo(BeEmpty())
+
+			// The controller never sets spec.clusterIP, so it owns no opinion about
+			// it. A read-modify-write reconcile would have to copy this value across
+			// or the update is rejected as immutable.
+			reconcileOnce()
+			Expect(getService().Spec.ClusterIP).To(Equal(original))
+		})
+
+		It("restores a Deployment image that was edited away", func() {
+			var deploy appsv1.Deployment
+			Expect(k8sClient.Get(ctx, typeNamespacedName, &deploy)).To(Succeed())
+			original := deploy.Spec.Template.Spec.Containers[0].Image
+
+			deploy.Spec.Template.Spec.Containers[0].Image = "nginx:tampered"
+			Expect(k8sClient.Update(ctx, &deploy)).To(Succeed())
+
+			reconcileOnce()
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, &deploy)).To(Succeed())
+			Expect(deploy.Spec.Template.Spec.Containers[0].Image).To(Equal(original))
 		})
 	})
 })

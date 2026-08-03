@@ -46,10 +46,26 @@ spec:
           spec:
             description: spec defines the desired state of ModelServer
             properties:
+              gpus:
+                description: |-
+                  gpus requests whole NVIDIA GPUs for each replica. Zero (the default) runs
+                  on CPU, which is slower but needs no device plugin -- every part of the
+                  control loop this operator implements works identically either way.
+
+                  Set only as a limit: nvidia.com/gpu is a non-overcommittable extended
+                  resource, so Kubernetes requires requests and limits to match and rejects
+                  specifying them separately.
+                format: int32
+                minimum: 0
+                type: integer
               image:
                 default: modelserver-mock:latest
                 type: string
               model:
+                description: |-
+                  model is the HuggingFace repo id to serve, e.g. "Qwen/Qwen3-0.6B". It is
+                  passed to the pod as both MODEL_ID (which selects the real engine) and
+                  MODEL_NAME (the label reported in /metrics and completion responses).
                 minLength: 1
                 type: string
               replicas:
