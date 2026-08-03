@@ -196,11 +196,20 @@ func ownerRef(ms *servingv1alpha1.ModelServer) *metav1ac.OwnerReferenceApplyConf
 		WithBlockOwnerDeletion(true)
 }
 
-func (r *ModelServerReconciler) buildDeployment(ms *servingv1alpha1.ModelServer) *appsv1ac.DeploymentApplyConfiguration {
-	labels := map[string]string{
+// instanceLabels identify everything belonging to one ModelServer. They are
+// stamped on the objects themselves, not only on the Pod template, so that
+// `kubectl get deploy,svc -l app=modelserver` finds what this operator manages.
+// Pods inherit them from the template; the Deployment and Service do not, which
+// is why they have to be set explicitly.
+func instanceLabels(ms *servingv1alpha1.ModelServer) map[string]string {
+	return map[string]string{
 		"app":                            "modelserver",
 		"serving.fanzhangg.dev/instance": ms.Name,
 	}
+}
+
+func (r *ModelServerReconciler) buildDeployment(ms *servingv1alpha1.ModelServer) *appsv1ac.DeploymentApplyConfiguration {
+	labels := instanceLabels(ms)
 
 	container := corev1ac.Container().
 		WithName("server").
@@ -231,7 +240,11 @@ func (r *ModelServerReconciler) buildDeployment(ms *servingv1alpha1.ModelServer)
 			}))
 	}
 
+	// spec.selector is immutable once the Deployment exists, so it keeps matching
+	// on the same two labels it always has. WithLabels only touches metadata,
+	// which is free to change.
 	return appsv1ac.Deployment(ms.Name, ms.Namespace).
+		WithLabels(labels).
 		WithOwnerReferences(ownerRef(ms)).
 		WithSpec(appsv1ac.DeploymentSpec().
 			WithReplicas(ms.Spec.Replicas).
@@ -269,8 +282,12 @@ func (r *ModelServerReconciler) buildDeployment(ms *servingv1alpha1.ModelServer)
 // does not offer for built-in types.
 func (r *ModelServerReconciler) reconcileService(ctx context.Context, ms *servingv1alpha1.ModelServer) error {
 	desired := corev1ac.Service(ms.Name, ms.Namespace).
+		WithLabels(instanceLabels(ms)).
 		WithOwnerReferences(ownerRef(ms)).
 		WithSpec(corev1ac.ServiceSpec().
+			// The selector stays on the instance label alone: it has to match Pods,
+			// and narrowing to one ModelServer is the whole job. The metadata labels
+			// above are for humans and kubectl, and are a separate concern.
 			WithSelector(map[string]string{
 				"serving.fanzhangg.dev/instance": ms.Name,
 			}).

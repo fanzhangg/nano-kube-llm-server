@@ -250,6 +250,25 @@ var _ = Describe("ModelServer Controller", func() {
 					Name: resourceName, Namespace: resourceNamespace}}))).To(Succeed())
 		})
 
+		// Pods inherit labels from the Pod template, but the Deployment and Service
+		// objects do not -- so `kubectl get deploy -l app=modelserver` returned
+		// nothing until these were stamped explicitly.
+		It("labels the Deployment and Service themselves, not just the Pods", func() {
+			var deploy appsv1.Deployment
+			Expect(k8sClient.Get(ctx, typeNamespacedName, &deploy)).To(Succeed())
+			Expect(deploy.Labels).To(HaveKeyWithValue("app", "modelserver"))
+			Expect(deploy.Labels).To(HaveKeyWithValue("serving.fanzhangg.dev/instance", resourceName))
+
+			svc := getService()
+			Expect(svc.Labels).To(HaveKeyWithValue("app", "modelserver"))
+			Expect(svc.Labels).To(HaveKeyWithValue("serving.fanzhangg.dev/instance", resourceName))
+
+			// The Service selector deliberately stays narrower than the labels.
+			Expect(svc.Spec.Selector).To(Equal(map[string]string{
+				"serving.fanzhangg.dev/instance": resourceName,
+			}))
+		})
+
 		It("restores a Service selector that was edited away", func() {
 			svc := getService()
 			Expect(svc.Spec.Selector).To(HaveKeyWithValue("serving.fanzhangg.dev/instance", resourceName))
