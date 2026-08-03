@@ -256,29 +256,29 @@ var _ = Describe("ModelServer Controller", func() {
 		It("labels the Deployment and Service themselves, not just the Pods", func() {
 			var deploy appsv1.Deployment
 			Expect(k8sClient.Get(ctx, typeNamespacedName, &deploy)).To(Succeed())
-			Expect(deploy.Labels).To(HaveKeyWithValue("app", "modelserver"))
-			Expect(deploy.Labels).To(HaveKeyWithValue("serving.fanzhangg.dev/instance", resourceName))
+			Expect(deploy.Labels).To(HaveKeyWithValue(appLabelKey, appLabelValue))
+			Expect(deploy.Labels).To(HaveKeyWithValue(instanceLabelKey, resourceName))
 
 			svc := getService()
-			Expect(svc.Labels).To(HaveKeyWithValue("app", "modelserver"))
-			Expect(svc.Labels).To(HaveKeyWithValue("serving.fanzhangg.dev/instance", resourceName))
+			Expect(svc.Labels).To(HaveKeyWithValue(appLabelKey, appLabelValue))
+			Expect(svc.Labels).To(HaveKeyWithValue(instanceLabelKey, resourceName))
 
 			// The Service selector deliberately stays narrower than the labels.
 			Expect(svc.Spec.Selector).To(Equal(map[string]string{
-				"serving.fanzhangg.dev/instance": resourceName,
+				instanceLabelKey: resourceName,
 			}))
 		})
 
 		It("restores a Service selector that was edited away", func() {
 			svc := getService()
-			Expect(svc.Spec.Selector).To(HaveKeyWithValue("serving.fanzhangg.dev/instance", resourceName))
+			Expect(svc.Spec.Selector).To(HaveKeyWithValue(instanceLabelKey, resourceName))
 
-			svc.Spec.Selector = map[string]string{"serving.fanzhangg.dev/instance": "someone-elses-pods"}
+			svc.Spec.Selector = map[string]string{instanceLabelKey: "someone-elses-pods"}
 			Expect(k8sClient.Update(ctx, &svc)).To(Succeed())
 
 			reconcileOnce()
 			Expect(getService().Spec.Selector).
-				To(HaveKeyWithValue("serving.fanzhangg.dev/instance", resourceName))
+				To(HaveKeyWithValue(instanceLabelKey, resourceName))
 		})
 
 		// Drift WITHIN a list entry the controller owns. spec.ports is a

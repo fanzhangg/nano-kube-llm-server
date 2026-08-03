@@ -44,6 +44,18 @@ import (
 // on the cluster, which is why spec.gpus defaults to 0.
 const gpuResourceName corev1.ResourceName = "nvidia.com/gpu"
 
+const (
+	// instanceLabelKey ties an owned object back to the ModelServer that created
+	// it. It is both a metadata label and the Service's Pod selector, so it must
+	// stay identical in all three places -- hence the constant.
+	instanceLabelKey = "serving.fanzhangg.dev/instance"
+
+	// appLabelKey / appLabelValue mark everything this operator manages,
+	// independent of which ModelServer it belongs to.
+	appLabelKey   = "app"
+	appLabelValue = "modelserver"
+)
+
 // ModelServerReconciler reconciles a ModelServer object
 type ModelServerReconciler struct {
 	client.Client
@@ -203,8 +215,8 @@ func ownerRef(ms *servingv1alpha1.ModelServer) *metav1ac.OwnerReferenceApplyConf
 // is why they have to be set explicitly.
 func instanceLabels(ms *servingv1alpha1.ModelServer) map[string]string {
 	return map[string]string{
-		"app":                            "modelserver",
-		"serving.fanzhangg.dev/instance": ms.Name,
+		appLabelKey:      appLabelValue,
+		instanceLabelKey: ms.Name,
 	}
 }
 
@@ -289,7 +301,7 @@ func (r *ModelServerReconciler) reconcileService(ctx context.Context, ms *servin
 			// and narrowing to one ModelServer is the whole job. The metadata labels
 			// above are for humans and kubectl, and are a separate concern.
 			WithSelector(map[string]string{
-				"serving.fanzhangg.dev/instance": ms.Name,
+				instanceLabelKey: ms.Name,
 			}).
 			WithPorts(corev1ac.ServicePort().
 				WithPort(8000).
