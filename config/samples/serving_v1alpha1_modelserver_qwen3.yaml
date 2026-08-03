@@ -1,0 +1,21 @@
+apiVersion: serving.fanzhangg.dev/v1alpha1
+kind: ModelServer
+metadata:
+  labels:
+    app.kubernetes.io/name: nano-kube-llm-server
+    app.kubernetes.io/managed-by: kustomize
+  name: qwen3-06b
+spec:
+  # A real HuggingFace repo id, unlike the placeholder samples. The controller
+  # passes this as MODEL_ID, which is what makes the server load real weights
+  # instead of falling back to the mock engine.
+  model: "Qwen/Qwen3-0.6B"
+  replicas: 1
+  # Built from model_server/Dockerfile.qwen -- weights are baked in, so the pod
+  # needs no network access and the Loading phase is real model loading rather
+  # than a download.
+  image: "modelserver-qwen:latest"
+  # CPU by default: single-digit tok/s, but every part of the control loop this
+  # operator implements behaves identically. Set to 1 on a cluster running the
+  # NVIDIA device plugin.
+  gpus: 0

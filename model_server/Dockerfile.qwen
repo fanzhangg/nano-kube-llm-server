@@ -1,0 +1,73 @@
+# Real-inference image: Qwen3 weights baked in, no network needed at runtime.
+#
+# The companion Dockerfile builds the mock image (~150MB, no torch), which is
+# still the CRD default for spec.image. This one is ~4GB. Two images rather than
+# one because most of the Kubernetes story -- Pending/Loading/Ready, owner refs,
+# readiness gating, queue-depth metrics -- needs no model at all, and paying 4GB
+# per pod to demonstrate it would be silly.
+#
+#   docker build -f Dockerfile.qwen -t modelserver-qwen:latest .
+#   docker build -f Dockerfile.qwen --build-arg MODEL_ID=Qwen/Qwen3-1.7B -t modelserver-qwen:1.7b .
+
+ARG MODEL_ID=Qwen/Qwen3-0.6B
+
+# Stage 1: pull weights at BUILD time so the runtime image never touches the hub.
+# Downloading at startup instead would re-fetch ~1.2GB on every pod restart, fail
+# outright on a node without egress, and make the Loading phase dominated by
+# network variance rather than by actual model loading.
+FROM python:3.12-slim AS weights
+ARG MODEL_ID
+# UV_LINK_MODE=copy: uv hardlinks out of its cache by default, which cannot work
+# when the cache is a mount on a different filesystem -- without this it falls
+# back to copying anyway, just noisily.
+ENV UV_LINK_MODE=copy HF_HUB_ENABLE_HF_TRANSFER=1
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=cache,target=/root/.cache/pip \
+    pip install uv && uv pip install --system "huggingface_hub[hf_transfer]"
+# Weights land in a cache mount too, so re-running this build (or building the
+# GPU variant next) reuses the ~1.2GB download instead of re-fetching it. The
+# copy into /opt/weights is what actually makes it part of the image.
+RUN --mount=type=cache,target=/root/.cache/huggingface \
+    python -c "from huggingface_hub import snapshot_download; snapshot_download('${MODEL_ID}')" \
+    && mkdir -p /opt/weights && cp -r /root/.cache/huggingface/. /opt/weights/
+
+FROM python:3.12-slim
+ARG MODEL_ID
+
+# uv rather than pip: parallel resolution and downloads, and consistent with the
+# uv-managed venv used for local development.
+#
+# CPU wheel: ~200MB instead of the multi-GB CUDA build. Qwen3-0.6B on CPU is slow
+# (single-digit tok/s) but functionally complete -- see Dockerfile.qwen-gpu and
+# set `gpus: 1` on the CR once you have a cluster with the NVIDIA device plugin.
+#
+# ORDER MATTERS, and getting it wrong is silent. `accelerate` hard-depends on
+# torch, and PyPI's linux torch IS the CUDA build -- installing accelerate before
+# torch resolves the whole nvidia-* stack (17 packages: cudnn, cublas, nccl, ...),
+# downloads several GB, and only then does the CPU wheel replace torch. uv does
+# not prune the orphaned CUDA libs, so they stay in the final layer: a multi-GB
+# image and a ~5 minute pip step, from an --index-url that looks correct.
+# Installing torch FIRST means accelerate finds it already satisfied.
+ENV UV_LINK_MODE=copy
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=cache,target=/root/.cache/pip \
+    pip install uv \
+    && uv pip install --system torch --index-url https://download.pytorch.org/whl/cpu \
+    && uv pip install --system fastapi uvicorn transformers accelerate
+
+COPY --from=weights /opt/weights /root/.cache/huggingface
+COPY main.py engines.py qwen.py nanogpt.py /app/
+WORKDIR /app
+
+# HF_HUB_OFFLINE makes a runtime download impossible rather than merely
+# unlikely: if the weights did not make it into the image, startup fails loudly
+# here instead of silently working in dev and stalling in a locked-down cluster.
+# It also removes the unauthenticated-request rate limiting entirely.
+ENV HF_HUB_OFFLINE=1 \
+    MODEL_ID=${MODEL_ID} \
+    MODEL_NAME=${MODEL_ID} \
+    LOAD_TIME_SECONDS=0 \
+    OMP_NUM_THREADS=4
+
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

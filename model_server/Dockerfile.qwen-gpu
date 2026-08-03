@@ -1,0 +1,71 @@
+# Real-inference image, CUDA build. Companion to Dockerfile.qwen (CPU wheel).
+#
+# No nvidia/cuda base image needed: PyTorch's CUDA wheels vendor their own CUDA
+# runtime libraries as nvidia-* pip packages, so python:3.12-slim plus the cu128
+# index is sufficient. The host still needs an NVIDIA driver and
+# nvidia-container-toolkit; the container brings everything above the driver.
+#
+#   docker build -f Dockerfile.qwen-gpu -t modelserver-qwen:gpu .
+#   docker run --rm --gpus all -p 8000:8000 modelserver-qwen:gpu
+#
+# On Kubernetes this needs the NVIDIA device plugin DaemonSet, and the CR needs
+# `gpus: 1` so the controller sets the nvidia.com/gpu limit.
+#
+# Expect ~8GB: the CUDA wheels alone are several GB, versus ~200MB for the CPU
+# wheel. That size difference is the whole reason this is a separate file.
+
+ARG MODEL_ID=Qwen/Qwen3-0.6B
+
+# Stage 1: pull weights at build time so the runtime image never touches the hub.
+FROM python:3.12-slim AS weights
+ARG MODEL_ID
+# hf_transfer + a cache mount shared with Dockerfile.qwen: whichever image you
+# build second reuses the ~1.2GB download instead of re-fetching it.
+ENV UV_LINK_MODE=copy HF_HUB_ENABLE_HF_TRANSFER=1
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=cache,target=/root/.cache/pip \
+    pip install uv && uv pip install --system "huggingface_hub[hf_transfer]"
+RUN --mount=type=cache,target=/root/.cache/huggingface \
+    python -c "from huggingface_hub import snapshot_download; snapshot_download('${MODEL_ID}')" \
+    && mkdir -p /opt/weights && cp -r /root/.cache/huggingface/. /opt/weights/
+
+FROM python:3.12-slim
+ARG MODEL_ID
+
+# uv rather than pip: it resolves and downloads in parallel, which matters here
+# because the CUDA wheels are ~3GB spread across a dozen nvidia-* packages that
+# pip would fetch one at a time. Also keeps tooling consistent with the uv-managed
+# venv used for local development.
+#
+# cu128 matches the torch 2.9.1+cu128 verified on the RTX 4070 Ti (sm_89).
+# Pinned deliberately: transformers 5.14.1 + torch 2.5.1 had a dynamo bug that
+# broke cache_implementation="static", fixed by moving to 2.9.x.
+#
+# ORDER MATTERS, and here it cost twice over. `accelerate` hard-depends on torch,
+# so installing it first resolved torch from PyPI -- which is the CUDA *13* build
+# (nvidia-cudnn-cu13, nvidia-nccl-cu13, ...). The build downloaded a complete
+# CUDA 13 stack, then the cu128 line downloaded a complete CUDA 12.8 stack over
+# it, and uv left the orphaned cu13 libs in the layer. Pinning the index on the
+# torch line does nothing if something else already dragged torch in. Install
+# torch FIRST and accelerate finds it satisfied.
+ENV UV_LINK_MODE=copy
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=cache,target=/root/.cache/pip \
+    pip install uv \
+    && uv pip install --system torch==2.9.1 --index-url https://download.pytorch.org/whl/cu128 \
+    && uv pip install --system fastapi uvicorn transformers accelerate
+
+COPY --from=weights /opt/weights /root/.cache/huggingface
+COPY main.py engines.py qwen.py nanogpt.py /app/
+WORKDIR /app
+
+# HF_HUB_OFFLINE makes a runtime download impossible rather than merely
+# unlikely: if the weights did not make it into the image, startup fails loudly
+# here instead of silently working in dev and stalling in a locked-down cluster.
+ENV HF_HUB_OFFLINE=1 \
+    MODEL_ID=${MODEL_ID} \
+    MODEL_NAME=${MODEL_ID} \
+    LOAD_TIME_SECONDS=0
+
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
