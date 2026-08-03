@@ -6,8 +6,13 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: qwen-small
 spec:
-  # Model name, passed to the serving container as the MODEL_NAME env var
-  model: "Qwen/Qwen2.5-0.5B-Instruct"
+  # The "mock/" prefix asks for the mock engine by name. spec.model is passed
+  # through as MODEL_ID, and any other value would send this image -- which
+  # ships no torch -- into a real model load it cannot complete. See
+  # config/samples/serving_v1alpha1_modelserver_qwen3.yaml for a real model.
+  model: "mock/qwen-small"
   replicas: 2
-  # Mock inference server; swap for a real vLLM image once available
+  # Mock inference server: ~150MB, no model. Enough to exercise the whole
+  # control loop -- Pending/Loading/Ready, owner refs, readiness gating,
+  # queue-depth metrics -- none of which needs real weights.
   image: "modelserver-mock:latest"

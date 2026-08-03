@@ -11,6 +11,12 @@ from fastapi.responses import StreamingResponse
 
 from engines import MockEngine, NanoGPTEngine, QwenEngine, load_nanogpt, load_qwen
 
+# Models under this prefix are served by the mock engine. The prefix rather than
+# a single sentinel so several mock ModelServers can coexist under distinct
+# names -- "mock/fable-5", "mock/kimi-k3" -- which is what the Pending/Loading/
+# Ready and queue-depth demos want.
+MOCK_MODEL_PREFIX = "mock/"
+
 
 @dataclass
 class Settings:
@@ -45,7 +51,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         async def _load():
             # Whichever backend is configured wins, most capable first. No fourth
             # env var to keep in sync -- configuring a model IS the selection.
-            if settings.model_id:
+            #
+            # A "mock/" prefix asks for the mock engine by name. spec.model is a
+            # required, non-empty field on the CRD and the controller passes it
+            # straight through as MODEL_ID, so a mock CR cannot simply leave it
+            # blank -- and any other value sends the mock image, which ships no
+            # torch, into load_qwen and an ImportError it can never satisfy.
+            # Naming a fake model keeps the selection rule intact rather than
+            # adding the engine switch this comment promises not to add.
+            if settings.model_id.startswith(MOCK_MODEL_PREFIX):
+                pass  # keep the MockEngine already installed at app creation
+            elif settings.model_id:
                 model, tokenizer = await asyncio.to_thread(load_qwen, settings.model_id)
                 app.state.engine = QwenEngine(model, tokenizer, settings.enable_thinking)
             elif settings.checkpoint_path:

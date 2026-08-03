@@ -74,6 +74,29 @@ async def test_health_200_after_loaded(make_client):
     assert resp.json() == {"status": "ok", "model": "qwen-x"}
 
 
+async def test_mock_prefix_keeps_the_mock_engine(make_client):
+    """A "mock/" model id must not attempt a real load.
+
+    spec.model is required and non-empty on the CRD, and the controller passes
+    it through as MODEL_ID, so a mock ModelServer cannot leave it blank. Without
+    the prefix check this reaches load_qwen and the mock image -- which ships no
+    torch -- fails with ImportError inside the un-awaited _load() task, leaving
+    /health on 503 forever with nothing in the logs to explain it.
+    """
+    app, client = await make_client(
+        Settings(model_id="mock/qwen-small", model_name="mock/qwen-small",
+                 load_time_seconds=0.05)
+    )
+    await asyncio.sleep(0.2)
+
+    assert type(app.state.engine).__name__ == "MockEngine"
+    assert (await client.get("/health")).status_code == 200
+
+    resp = await client.post("/v1/completions", json={"prompt": "hi", "max_tokens": 4})
+    assert resp.status_code == 200
+    assert resp.json()["model"] == "mock/qwen-small"
+
+
 # --- 2. non-streaming /v1/completions -----------------------------------
 
 
