@@ -268,6 +268,75 @@ class Scheduler:
     def has_work(self) -> bool:
         return bool(self.waiting or self.running)
 
+    # -----------------------------------------------------------------------
+    # TODO 7 -- abort one sequence (Day 12)
+    # -----------------------------------------------------------------------
+
+    def abort(self, seq: Sequence, reason: str = "cancelled") -> None:
+        """Give up on one sequence, wherever it currently is.
+
+        Called when an HTTP client disconnects. Without it, a request whose
+        client walked away keeps its batch slot and burns GPU generating tokens
+        into a queue nobody will ever read -- until max_new_tokens. On a loaded
+        server with max_tokens=512, a handful of impatient clients can hold most
+        of your capacity producing nothing.
+
+        Two states to handle, and the second is the one that is easy to miss:
+
+        - already RUNNING: set seq.finish_reason = reason. The next schedule()
+          filters it out of `running` on its own; you must not touch the deque
+          here, because a concurrent tick may be iterating it.
+        - still WAITING: setting finish_reason is NOT enough. schedule() only
+          filters `running` -- a finished sequence sitting in `waiting` would
+          still be admitted later and run to completion for a client that left
+          minutes ago. Remove it from the waiting deque explicitly.
+
+        Then seq.emit(None) so anything blocked on `await seq.queue.get()` wakes
+        up instead of hanging forever. Emitting twice is harmless (the consumer
+        stops at the first sentinel), so do not bother guarding it -- but DO make
+        the whole method safe to call on an already-finished sequence, because
+        the engine's `finally` block will do exactly that on the normal path.
+        """
+        if seq.is_finished:
+            return
+        seq.finish_reason = reason
+        try:
+            self.waiting.remove(seq)
+        except ValueError:
+            pass
+        seq.emit(None)
+
+    # -----------------------------------------------------------------------
+    # TODO 8 -- fail everything (Day 12)
+    # -----------------------------------------------------------------------
+
+    def fail_all(self, exc: BaseException) -> list[Sequence]:
+        """Tear down every in-flight request after the loop hits a fatal error.
+
+        A tick raising is not hypothetical: CUDA OOM at max_batch_tokens=8192 on
+        a 12GB card is one bad batch away. Without this, run_loop's task dies and
+        every request in flight blocks on `await seq.queue.get()` FOREVER -- no
+        error, no 500, no timeout. The server keeps accepting connections and
+        answers none of them, which reads as a hang rather than a crash and is
+        about the worst failure mode an inference server can have.
+
+        HuggingFace ships the same method on its manager (`fail_all_requests`)
+        for exactly this reason -- it is not over-engineering.
+
+        Mark every sequence in BOTH deques with finish_reason = "error", emit the
+        sentinel on each so their waiters wake, clear both deques, and return the
+        sequences you failed. Do not re-raise; run_loop decides what to do next.
+        """
+        failed = list(self.running) + list(self.waiting)
+        for s in failed:
+            if not s.is_finished:
+                s.finish_reason = "error"
+            s.emit(None)
+
+        self.running.clear()
+        self.waiting.clear()
+        return failed
+
 
 # ---------------------------------------------------------------------------
 # TODO 3 -- per-sequence sampling
@@ -450,13 +519,29 @@ async def run_loop(model, scheduler: Scheduler, pad_id: int, idle_sleep: float =
     When there is no work the loop sleeps briefly rather than spinning. A
     condition variable would be tidier; a 5ms poll is easier to read and adds at
     most 5ms to the latency of a request that arrives into an idle server.
+
+    A tick that raises takes every in-flight request down with it (fail_all) and
+    then re-raises, so the task dies loudly. The alternative -- swallowing the
+    error and continuing -- sounds more robust and is worse: after a CUDA OOM the
+    cache and the allocator are in an unknown state, and a server that keeps
+    accepting work in that condition produces wrong output instead of an outage.
+    Fail the batch, kill the loop, let Kubernetes restart the pod.
     """
     state: dict = {"members": (), "cache": None}
     while True:
         if not scheduler.has_work():
             await asyncio.sleep(idle_sleep)
             continue
-        await asyncio.to_thread(step, model, scheduler, pad_id, state)
+        try:
+            await asyncio.to_thread(step, model, scheduler, pad_id, state)
+        except asyncio.CancelledError:
+            # Normal shutdown (lifespan cancels this task). Waiters still need
+            # waking, but this is not an error worth re-raising as one.
+            scheduler.fail_all(asyncio.CancelledError())
+            raise
+        except BaseException as exc:
+            scheduler.fail_all(exc)
+            raise
 
 
 def resolve_eos_ids(model, tokenizer) -> set[int]:
