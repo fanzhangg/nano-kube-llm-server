@@ -342,7 +342,7 @@ def test_the_mock_path_imports_no_torch():
 
 @pytest.fixture(scope="module")
 def tiny_runner():
-    transformers = pytest.importorskip("transformers")
+    pytest.importorskip("transformers")
     from transformers import Qwen3Config, Qwen3ForCausalLM
 
     torch.manual_seed(0)

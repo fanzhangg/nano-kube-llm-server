@@ -98,9 +98,27 @@ class QwenRunner(ModelRunner):
         return set(eos) if isinstance(eos, (list, tuple)) else {eos}
 
     def encode(self, prompt: str) -> list[int]:
-        from qwen import build_prompt
+        """Wrap the prompt in the control tokens Qwen3 was fine-tuned on, then tokenize.
 
-        return self.tokenizer(build_prompt(self.tokenizer, prompt, self.enable_thinking)).input_ids
+        A bare string produces a model that continues the user's turn instead of
+        answering it -- which reads like a broken model but is a broken prompt.
+
+        enable_thinking=False does not remove the reasoning block; it prefills an
+        empty one (`<think>\\n\\n</think>`) so the model treats reasoning as already
+        finished. Left enabled, Qwen3 reasons for hundreds of tokens first.
+
+        This lives here rather than in qwen.py because it needs only the
+        tokenizer, and qwen.py imports transformers at module scope for the
+        loader. Keeping it there made encoding untestable without transformers
+        installed, even against a stub tokenizer.
+        """
+        text = self.tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=self.enable_thinking,
+        )
+        return self.tokenizer(text).input_ids
 
     def decode(self, token_ids: list[int]) -> str:
         return self.tokenizer.decode(token_ids, skip_special_tokens=True)

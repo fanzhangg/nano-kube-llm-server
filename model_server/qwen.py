@@ -1,9 +1,4 @@
-"""Qwen3 loader and chat template. Execution lives in runners.QwenRunner.
-
-This module owns "how to generate" and nothing else. It deliberately imports no
-FastAPI: main.py's Engine ABC adapts these functions to HTTP, which is what makes
-the engine swappable without touching a single request handler.
-"""
+"""Qwen3 weight loading. Prompting and execution live in runners.QwenRunner."""
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -25,27 +20,6 @@ def pick_dtype(device: str) -> torch.dtype:
         return torch.bfloat16
     else:
         return torch.float32
-
-
-def build_prompt(tokenizer, prompt: str, enable_thinking: bool = False) -> str:
-    """Wrap a raw prompt in the control tokens Qwen3 was fine-tuned on.
-
-    Qwen3 is instruct tuned and expects `<|im_start|>user ... <|im_end|>
-    <|im_start|>assistant`. A bare string produces a model that continues the
-    user's turn instead of answering -- which reads like a broken model but is a
-    broken prompt.
-
-    enable_thinking=False does not remove the reasoning block; it prefills an
-    empty one (`<think>\\n\\n</think>`) so the model treats reasoning as already
-    finished and goes straight to the answer. Left enabled, Qwen3 will reason for
-    hundreds of tokens first.
-    """
-    return tokenizer.apply_chat_template(
-        [{"role": "user", "content": prompt}],
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=enable_thinking,
-    )
 
 
 def load_qwen(model_id: str = DEFAULT_MODEL_ID, device: str | None = None):
