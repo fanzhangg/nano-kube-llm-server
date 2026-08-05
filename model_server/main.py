@@ -20,7 +20,9 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
 from fastapi import FastAPI, Response
-from fastapi.responses import StreamingResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field, model_validator
 
 from batching import Scheduler, run_loop
 from engines import BatchingEngine
@@ -42,6 +44,68 @@ MOCK_MODEL_PREFIX = "mock/"
 # parsing -- and would dress a dead run_loop up as a completed answer.
 # "cancelled" is here for completeness; it means the client already left.
 FATAL_FINISH_REASONS = {"error", "cancelled"}
+
+# Below this, temperature means "greedy" rather than "divide the logits by an
+# almost-zero number". vLLM and SGLang both carry this constant (_SAMPLING_EPS,
+# 1e-5 and 1e-6 respectively) for the same reason: temperature=1e-40 is not a
+# malformed request, it is what a client sends when it wants determinism, and
+# without a floor it produces inf logits, a NaN probability tensor, and a
+# RuntimeError from multinomial deep inside the batch.
+SAMPLING_EPS = 1e-5
+
+
+class CompletionRequest(BaseModel):
+    """Admission validation: everything the engine may not be asked to survive.
+
+    This is the layer both vLLM and SGLang put in FRONT of the engine --
+    SamplingParams._verify_args / SamplingParams.verify -- and the reason a bad
+    request costs one 400 there instead of the process. Before it existed here,
+    `top_k` went from JSON straight into torch.topk, so {"top_k": "5"} raised a
+    TypeError on a WORKER THREAD, inside a forward pass shared with seven other
+    requests, where the only available response was to fail the whole batch.
+
+    Unknown fields are ignored rather than rejected: real clients send `n`,
+    `echo`, `stop`, `logit_bias` and more, and 400-ing an OpenAI SDK for sending
+    what the OpenAI SDK sends would be a worse contract than ignoring it.
+    """
+
+    prompt: str = ""
+    max_tokens: int = Field(default=64, ge=0)
+    # Upper bound copied from vLLM: beyond ~2 the distribution is noise, and a
+    # finite cap is also what stops `inf` and `nan` from arriving as floats.
+    temperature: float = Field(default=0.8, ge=0.0, le=2.0)
+    # -1 (SGLang) and 0 (vLLM) both spell "disabled"; anything below -1 is a
+    # typo, not a convention.
+    top_k: int | None = Field(default=None, ge=-1)
+    stream: bool = False
+
+    @model_validator(mode="after")
+    def _normalize(self):
+        """Fold the disabled/greedy spellings into the ones _sample understands.
+
+        Normalising rather than rejecting, because both engines normalise here:
+        a client asking for temperature=1e-40 wants greedy decoding and should
+        get it, not a 400 explaining that its zero is insufficiently zero.
+        """
+        if self.temperature < SAMPLING_EPS:
+            self.temperature = 0.0  # -> argmax in ModelRunner._sample
+        if self.top_k is not None and self.top_k <= 0:
+            self.top_k = None
+        return self
+
+
+def error_response(status: int, message: str, err_type: str, param: str | None = None):
+    """The OpenAI error envelope: {"error": {message, type, param, code}}.
+
+    Not a completion with a bad finish_reason, which is what this server used to
+    return -- HTTP 200 carrying finish_reason="error" told an SDK the request had
+    succeeded, while the value itself was outside the schema's enum.
+    """
+    return JSONResponse(
+        status_code=status,
+        content={"error": {"message": message, "type": err_type,
+                           "param": param, "code": None}},
+    )
 
 
 @dataclass
@@ -113,30 +177,66 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.scheduler = Scheduler(settings.max_batch_size, settings.max_batch_tokens)
     app.state.engine = BatchingEngine(MockRunner(), app.state.scheduler)
 
+    @app.exception_handler(RequestValidationError)
+    async def _invalid_request(request, exc: RequestValidationError):
+        """FastAPI's 422 is not the OpenAI contract; a bad request is a 400.
+
+        Only the first error is reported, with `param` naming the field, which
+        is the shape an OpenAI client already knows how to display.
+        """
+        first = exc.errors()[0]
+        param = ".".join(str(p) for p in first["loc"][1:]) or None
+        return error_response(400, first["msg"], "invalid_request_error", param)
+
+    def loop_is_dead() -> bool:
+        """True once nothing is draining the scheduler.
+
+        run_loop's contract is to die loudly on an unrecoverable error, and its
+        docstring says "let Kubernetes restart the pod" -- but nothing used to
+        SAY so. /health stayed 200, readiness kept passing, the Service kept
+        routing, and every arriving request blocked on a queue no one would ever
+        drain: a pod that accepts work and answers none of it, indefinitely.
+        """
+        task = getattr(app.state, "loop_task", None)
+        return task is None or task.done()
+
     @app.get("/health")
     async def health():
         if not app.state.runtime["loaded"]:
             return Response(status_code=503)  # -> readiness fails -> Loading phase
+        if loop_is_dead():
+            return Response(status_code=503)  # -> out of the Service's endpoints
         return {"status": "ok", "model": settings.model_name}
 
     @app.post("/v1/completions")
-    async def completions(body: dict):
-        prompt = body.get("prompt", "")
-        max_tokens = int(body.get("max_tokens", 64))
-        stream = bool(body.get("stream", False))
-        temperature = float(body.get("temperature", 0.8))
-        top_k = body.get("top_k")  # vLLM extension, not in the OpenAI schema
+    async def completions(body: CompletionRequest):
+        # Fail fast rather than accept work nobody will do. vLLM does the same
+        # once its EngineCore dies: in-flight requests error out and new ones are
+        # refused, instead of every client discovering the outage by timeout.
+        if loop_is_dead():
+            return error_response(
+                503, "the inference loop is not running", "service_unavailable"
+            )
+
+        prompt, max_tokens = body.prompt, body.max_tokens
+        temperature, top_k = body.temperature, body.top_k
 
         cmpl_id = f"cmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
 
-        if stream:
+        if body.stream:
             return StreamingResponse(
                 _stream(cmpl_id, created, prompt, max_tokens, temperature, top_k),
                 media_type="text/event-stream",
             )
 
         result = await app.state.engine.generate(prompt, max_tokens, temperature, top_k)
+        if result.finish_reason in FATAL_FINISH_REASONS:
+            # Nothing has been written yet on this path, so unlike the streaming
+            # case a real status code is still available. Use it.
+            return error_response(
+                500, f"generation failed: {result.finish_reason}", "internal_server_error"
+            )
 
         return {
             "id": cmpl_id,

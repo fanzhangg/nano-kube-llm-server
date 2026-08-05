@@ -134,10 +134,154 @@ async def test_completion_defaults_when_fields_omitted(make_client):
     assert usage["completion_tokens"] == 64  # max_tokens defaults to 64
 
 
-async def test_completion_missing_body_is_422(make_client):
+async def test_completion_missing_body_is_400(make_client):
+    """400, not FastAPI's default 422: the OpenAI contract for a bad request."""
     _, client = await make_client()
     resp = await client.post("/v1/completions")
-    assert resp.status_code == 422
+    assert resp.status_code == 400
+    assert resp.json()["error"]["type"] == "invalid_request_error"
+
+
+# --- 2b. admission validation -------------------------------------------
+#
+# Everything below used to reach the sampler, on a worker thread, inside a
+# forward pass shared with every other in-flight request -- where the only
+# response available was to fail the whole batch and kill the loop. vLLM and
+# SGLang both validate in front of the engine for exactly this reason.
+
+
+@pytest.mark.parametrize(
+    "body,param",
+    [
+        ({"prompt": "hi", "top_k": "not-an-int"}, "top_k"),
+        ({"prompt": "hi", "top_k": 2.5}, "top_k"),          # -> torch.topk TypeError
+        ({"prompt": "hi", "top_k": -7}, "top_k"),           # -1/0 mean disabled; -7 is a typo
+        ({"prompt": "hi", "max_tokens": -1}, "max_tokens"),
+        ({"prompt": "hi", "temperature": -0.5}, "temperature"),
+        ({"prompt": "hi", "temperature": 99}, "temperature"),
+        ({"prompt": ["a", "b"]}, "prompt"),
+    ],
+)
+async def test_invalid_sampling_params_are_rejected_at_admission(make_client, body, param):
+    _, client = await make_client()
+
+    resp = await client.post("/v1/completions", json=body)
+
+    assert resp.status_code == 400
+    error = resp.json()["error"]
+    assert error["type"] == "invalid_request_error"
+    assert error["param"] == param
+
+
+async def test_a_rejected_request_leaves_the_server_serving(make_client):
+    """The whole point. A 400 must cost one request, not the process.
+
+    Before admission validation, {"top_k": "5"} raised inside the shared forward
+    pass, fail_all took down every in-flight request, run_loop died, /health
+    stayed 200, and every later request hung forever on a queue nobody drained.
+    """
+    # load_time_seconds=0 so /health reports the LOOP's health here rather than
+    # the loading window it also multiplexes.
+    _, client = await make_client(Settings(load_time_seconds=0))
+    await asyncio.sleep(0.05)
+
+    rejected = await client.post("/v1/completions", json={"prompt": "hi", "top_k": "x"})
+    assert rejected.status_code == 400
+
+    after = await client.post("/v1/completions", json={"prompt": "hi", "max_tokens": 4})
+    assert after.status_code == 200
+    assert (await client.get("/health")).status_code == 200
+
+
+async def test_a_near_zero_temperature_means_greedy_not_a_crash(make_client):
+    """1e-40 is not malformed -- it is a client asking for determinism.
+
+    Rejecting it would be defensible; crashing is not, and dividing logits by
+    1e-40 gives inf, then a NaN probability tensor, then a RuntimeError from
+    multinomial in the middle of someone else's batch. Both vLLM and SGLang
+    fold it to greedy instead (_SAMPLING_EPS), which is what this asserts.
+    """
+    _, client = await make_client()
+
+    resp = await client.post(
+        "/v1/completions", json={"prompt": "hi", "max_tokens": 4, "temperature": 1e-40}
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["choices"][0]["finish_reason"] == "length"
+
+
+async def test_unknown_fields_are_ignored_not_rejected(make_client):
+    """Real OpenAI clients send fields this server does not implement."""
+    _, client = await make_client()
+
+    resp = await client.post(
+        "/v1/completions",
+        json={"prompt": "hi", "max_tokens": 2, "model": "qwen", "n": 1, "echo": False},
+    )
+
+    assert resp.status_code == 200
+
+
+# --- 2c. failing fast when the blast radius really is everyone ----------
+
+
+async def test_a_dead_loop_fails_readiness(make_client):
+    """run_loop's docstring says "let Kubernetes restart the pod" -- this is what says so.
+
+    While /health stayed 200 with a dead loop, the Service kept routing to a pod
+    that could not answer, and requests hung instead of failing. Readiness is
+    the signal that takes it out of the endpoints.
+    """
+    app, client = await make_client(Settings(load_time_seconds=0))
+    await asyncio.sleep(0.05)
+    assert (await client.get("/health")).status_code == 200
+
+    app.state.loop_task.cancel()
+    await asyncio.sleep(0.05)
+
+    assert (await client.get("/health")).status_code == 503
+
+
+async def test_a_dead_loop_refuses_new_work_instead_of_hanging(make_client):
+    """503 now beats a request that blocks until the client's timeout.
+
+    Accepting work into a scheduler nobody drains is the failure that hid the
+    original bug: no error, no 500, no log line -- just requests that never
+    came back.
+    """
+    app, client = await make_client(Settings(load_time_seconds=0))
+    await asyncio.sleep(0.05)
+    app.state.loop_task.cancel()
+    await asyncio.sleep(0.05)
+
+    resp = await asyncio.wait_for(
+        client.post("/v1/completions", json={"prompt": "hi", "max_tokens": 4}), timeout=2
+    )
+
+    assert resp.status_code == 503
+    assert resp.json()["error"]["type"] == "service_unavailable"
+
+
+async def test_a_failed_generation_is_a_500_not_a_200(make_client):
+    """finish_reason="error" is not an OpenAI value and not a success.
+
+    A crashed loop used to answer 200 with an empty completion and
+    finish_reason="error": outside the schema's enum, wrapped in a success, so
+    an SDK reported that the request had worked.
+    """
+    app, client = await make_client(Settings(load_time_seconds=0))
+    await asyncio.sleep(0.05)
+
+    task = asyncio.create_task(
+        client.post("/v1/completions", json={"prompt": "hi", "max_tokens": 200})
+    )
+    await asyncio.sleep(0.05)
+    app.state.scheduler.fail_all(RuntimeError("CUDA out of memory"))
+    resp = await asyncio.wait_for(task, timeout=2)
+
+    assert resp.status_code == 500
+    assert resp.json()["error"]["type"] == "internal_server_error"
 
 
 # --- 3. streaming /v1/completions ---------------------------------------
