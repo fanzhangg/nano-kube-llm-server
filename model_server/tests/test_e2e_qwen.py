@@ -395,7 +395,69 @@ def test_multibyte_output_is_never_split_across_chunks(client):
     assert "�" not in text
 
 
-# --- 4. a slot released is a slot returned ---------------------------------
+# --- 4. a bad request costs one request ------------------------------------
+#
+# The blast-radius claim, stated where it can actually be tested: with real
+# weights, a real scheduler, and real neighbours in the batch. test_main.py
+# grades the same rules against MockRunner, which never samples -- so it cannot
+# show that a rejected request would otherwise have reached torch.
+
+
+@pytest.mark.parametrize(
+    "body,param",
+    [
+        ({"prompt": "hi", "top_k": 2.5}, "top_k"),
+        ({"prompt": "hi", "max_tokens": -1}, "max_tokens"),
+        ({"prompt": "hi", "temperature": -0.5}, "temperature"),
+    ],
+)
+def test_an_invalid_request_is_rejected_with_the_openai_error_envelope(service, body, param):
+    """400 and {"error": {...}}, not 200 with a finish_reason outside the enum.
+
+    Raw httpx, not the SDK, because the SDK raises BadRequestError on a 400 and
+    the point here is the BODY: `type` and `param` are what a client displays.
+    """
+    response = httpx.post(f"{service}/v1/completions", json=body, timeout=60)
+
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["type"] == "invalid_request_error"
+    assert error["param"] == param
+
+
+def test_rejected_requests_do_not_disturb_the_requests_around_them(client, service):
+    """Bad requests interleaved with good ones, all in flight together.
+
+    This is the regression that started it: {"top_k": "5"} raised inside a
+    forward pass shared with everyone else, fail_all took the whole batch down,
+    the loop died, and /health went on reporting 200 while every later request
+    hung forever. Every part of that is asserted here -- the good responses
+    survive intact, the server is still ready, and the batch drains to empty.
+    """
+    def bad():
+        return httpx.post(
+            f"{service}/v1/completions",
+            json={"prompt": "hi", "max_tokens": 8, "top_k": 2.5},
+            timeout=60,
+        ).status_code
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        good = [pool.submit(greedy, client, prompt, 12) for prompt in PROMPTS]
+        rejected = [pool.submit(bad) for _ in range(4)]
+        completions = [future.result() for future in good]
+        statuses = [future.result() for future in rejected]
+
+    assert statuses == [400] * 4
+    for completion in completions:
+        assert_shape(completion, max_tokens=12)
+
+    assert httpx.get(f"{service}/health", timeout=30).status_code == 200
+    metrics = httpx.get(f"{service}/metrics", timeout=30).text
+    assert metric_value(metrics, "vllm:num_requests_running") == 0
+    assert metric_value(metrics, "vllm:num_requests_waiting") == 0
+
+
+# --- 5. a slot released is a slot returned ---------------------------------
 
 
 def test_abandoning_a_stream_frees_the_batch_slot(service):
