@@ -89,7 +89,7 @@ async def test_mock_prefix_keeps_the_mock_engine(make_client):
     )
     await asyncio.sleep(0.2)
 
-    assert type(app.state.engine).__name__ == "MockEngine"
+    assert type(app.state.engine.runner).__name__ == "MockRunner"
     assert (await client.get("/health")).status_code == 200
 
     resp = await client.post("/v1/completions", json={"prompt": "hi", "max_tokens": 4})
@@ -113,7 +113,7 @@ async def test_completion_response_shape(make_client):
     assert choice["index"] == 0
     assert choice["logprobs"] is None
     assert choice["finish_reason"] == "length"
-    assert "8 tokens" in choice["text"]
+    assert choice["text"] == "mock " * 8
 
 
 async def test_completion_usage_accounting(make_client):
@@ -163,15 +163,17 @@ async def test_streaming_shape_and_termination(make_client):
         len(chunks) - 1
     ) + ["length"]
 
-    reassembled = "".join(c["choices"][0]["text"] for c in chunks).strip()
-    assert reassembled == "[mock output of 4 tokens]"
+    # No .strip(): the stream must reassemble byte-for-byte into what the
+    # non-streaming path returns, trailing space included.
+    reassembled = "".join(c["choices"][0]["text"] for c in chunks)
+    assert reassembled == "mock " * 4  # one piece per decode tick
 
 
 # --- 4. concurrency accounting -------------------------------------------
 
 
 async def test_concurrency_ceiling_and_drain(make_client):
-    _, client = await make_client(Settings(max_concurrency=2))
+    _, client = await make_client(Settings(max_batch_size=2))
     tasks = [
         asyncio.create_task(
             client.post("/v1/completions", json={"prompt": "x", "max_tokens": 100})
@@ -190,7 +192,7 @@ async def test_concurrency_ceiling_and_drain(make_client):
 
 
 async def test_cancel_while_queued_does_not_leak_waiting(make_client):
-    _, client = await make_client(Settings(max_concurrency=2))
+    _, client = await make_client(Settings(max_batch_size=2))
     tasks = [
         asyncio.create_task(
             client.post("/v1/completions", json={"prompt": "x", "max_tokens": 200})
@@ -216,7 +218,7 @@ async def test_cancel_while_queued_does_not_leak_waiting(make_client):
 
 
 async def test_cancel_while_running_does_not_leak_running(make_client):
-    _, client = await make_client(Settings(max_concurrency=2))
+    _, client = await make_client(Settings(max_batch_size=2))
     tasks = [
         asyncio.create_task(
             client.post("/v1/completions", json={"prompt": "x", "max_tokens": 200})
@@ -240,7 +242,7 @@ async def test_cancel_while_running_does_not_leak_running(make_client):
 
 
 async def test_streaming_request_counts_toward_running(make_client):
-    _, client = await make_client(Settings(max_concurrency=1))
+    _, client = await make_client(Settings(max_batch_size=1))
 
     async def consume_stream():
         async with client.stream(
@@ -285,7 +287,7 @@ async def test_metrics_format_and_label(make_client):
 
 
 async def test_metrics_not_blocked_by_in_flight_completion(make_client):
-    _, client = await make_client(Settings(max_concurrency=1))
+    _, client = await make_client(Settings(max_batch_size=1))
     slow = asyncio.create_task(
         client.post("/v1/completions", json={"prompt": "x", "max_tokens": 500})
     )
@@ -305,12 +307,12 @@ async def test_zero_max_tokens(make_client):
     assert resp.status_code == 200
     body = resp.json()
     assert body["usage"]["completion_tokens"] == 0
-    assert body["choices"][0]["text"] == "[mock output of 0 tokens]"
+    assert body["choices"][0]["text"] == ""
 
 
 async def test_instances_do_not_share_state(make_client):
-    _, client_a = await make_client(Settings(model_name="a", max_concurrency=1))
-    _, client_b = await make_client(Settings(model_name="b", max_concurrency=1))
+    _, client_a = await make_client(Settings(model_name="a", max_batch_size=1))
+    _, client_b = await make_client(Settings(model_name="b", max_batch_size=1))
 
     busy_a = asyncio.create_task(
         client_a.post("/v1/completions", json={"prompt": "x", "max_tokens": 200})

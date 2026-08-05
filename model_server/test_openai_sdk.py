@@ -26,7 +26,7 @@ def _free_port() -> int:
 @pytest.fixture(scope="module")
 def live_server():
     port = _free_port()
-    app = create_app(Settings(model_name="qwen-live", load_time_seconds=0, max_concurrency=4))
+    app = create_app(Settings(model_name="qwen-live", load_time_seconds=0, max_batch_size=4))
     config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
     server = uvicorn.Server(config)
 
@@ -70,4 +70,4 @@ def test_streaming_iterates_to_completion(live_server):
         texts.append(event.choices[0].text)
         last_finish = event.choices[0].finish_reason
     assert last_finish == "length"
-    assert "mock output of 8 tokens" in "".join(texts)
+    assert "".join(texts) == "mock " * 8
