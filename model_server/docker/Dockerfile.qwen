@@ -6,8 +6,11 @@
 # readiness gating, queue-depth metrics -- needs no model at all, and paying 4GB
 # per pod to demonstrate it would be silly.
 #
-#   docker build -f Dockerfile.qwen -t modelserver-qwen:latest .
-#   docker build -f Dockerfile.qwen --build-arg MODEL_ID=Qwen/Qwen3-1.7B -t modelserver-qwen:1.7b .
+# Build from model_server/, not from docker/: the COPY paths below are relative
+# to the build context, and the sources live one level up from this file.
+#
+#   docker build -f docker/Dockerfile.qwen -t modelserver-qwen:latest .
+#   docker build -f docker/Dockerfile.qwen --build-arg MODEL_ID=Qwen/Qwen3-1.7B -t modelserver-qwen:1.7b .
 
 ARG MODEL_ID=Qwen/Qwen3-0.6B
 

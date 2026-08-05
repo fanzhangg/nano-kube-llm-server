@@ -5,6 +5,11 @@
 # batching.py imports no torch: the Kubernetes story (Pending/Loading/Ready,
 # readiness gating, queue-depth metrics, autoscaling on num_requests_waiting)
 # exercises the real admission rule here, not a simulation of it.
+#
+# Build from model_server/, not from docker/: the COPY path below is relative to
+# the build context, and the sources live one level up from this file.
+#
+#   docker build -f docker/Dockerfile -t modelserver-mock:latest .
 FROM python:3.12-slim
 RUN pip install --no-cache-dir fastapi uvicorn
 COPY main.py engines.py batching.py runners.py /app/

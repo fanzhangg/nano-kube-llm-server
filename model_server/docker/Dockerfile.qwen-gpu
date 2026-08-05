@@ -5,7 +5,10 @@
 # index is sufficient. The host still needs an NVIDIA driver and
 # nvidia-container-toolkit; the container brings everything above the driver.
 #
-#   docker build -f Dockerfile.qwen-gpu -t modelserver-qwen:gpu .
+# Build from model_server/, not from docker/: the COPY paths below are relative
+# to the build context, and the sources live one level up from this file.
+#
+#   docker build -f docker/Dockerfile.qwen-gpu -t modelserver-qwen:gpu .
 #   docker run --rm --gpus all -p 8000:8000 modelserver-qwen:gpu
 #
 # On Kubernetes this needs the NVIDIA device plugin DaemonSet, and the CR needs
