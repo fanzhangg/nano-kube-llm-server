@@ -3,7 +3,14 @@ uvicorn
 pytest
 httpx
 openai
-# Milestone 2 (nano-GPT): CPU wheel is enough; the extra index makes pip prefer
-# the +cpu build over the multi-GB CUDA build from PyPI.
+# CPU wheel is enough; the extra index makes pip prefer the +cpu build over the
+# multi-GB CUDA build from PyPI.
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch
+# QwenRunner's integration tests build a ~5M-param randomly-initialised Qwen3 --
+# same architecture and forward signature as the 0.6B, no weights downloaded,
+# two seconds on CPU. Without transformers here those tests silently SKIP, and
+# nothing in CI ever checks that transformers actually accepts the tensors
+# QwenRunner builds: shapes, dtypes, mask width, cache hand-off. That is exactly
+# the layer stubs cannot cover and the first thing to break on a version bump.
+transformers
