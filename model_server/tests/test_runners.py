@@ -257,6 +257,45 @@ def test_reset_drops_the_cache(runner):
     assert runner.model.last["past_key_values"] is None
 
 
+def test_a_row_whose_sampling_raises_comes_back_as_none(runner):
+    """Attribution is what makes containment possible.
+
+    Sampling row 3 touches only row 3, so a failure there is one request's --
+    reported as None and aborted by run_loop, not raised into the tick where the
+    only available response is to fail everyone. top_k as a string is the
+    concrete case: it reaches torch.topk and raises TypeError.
+
+    Admission validation should stop this ever arriving (see
+    main.CompletionRequest); this is the second line, for the failures nobody
+    thought to validate -- NaN logits from a single row's history, say.
+    """
+    good, bad = seq(3), seq(3)
+    bad.top_k = "5"  # what {"top_k": "5"} used to deliver straight to torch
+    good.temperature = bad.temperature = 0.9
+
+    picked = runner._sample(torch.randn(2, VOCAB), [good, bad])
+
+    assert isinstance(picked[0], int)
+    assert picked[1] is None
+
+
+def test_an_out_of_memory_error_is_not_contained(runner, monkeypatch):
+    """OOM is everybody's problem and must stay fatal.
+
+    Containing it would mean serving the other rows out of an allocator in an
+    unknown state: wrong output instead of an outage. vLLM draws the same line
+    (EngineDeadError, "Unrecoverable"), and run_loop's fail_all depends on this
+    reaching it as a raise.
+    """
+    def boom(*args, **kwargs):
+        raise torch.cuda.OutOfMemoryError("CUDA out of memory")
+
+    monkeypatch.setattr(runner, "_sample_row", boom)
+
+    with pytest.raises(torch.cuda.OutOfMemoryError):
+        runner._sample(torch.randn(1, VOCAB), [seq(3)])
+
+
 def test_execute_returns_one_token_per_row(runner):
     picked = runner.execute(ForwardBatch(seqs=[seq(3), seq(5)], is_prefill=True))
 

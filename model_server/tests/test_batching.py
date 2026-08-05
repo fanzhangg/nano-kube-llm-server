@@ -371,6 +371,69 @@ async def test_a_dying_tick_fails_every_request_instead_of_hanging():
 
 
 @pytest.mark.anyio
+async def test_a_row_that_fails_alone_does_not_take_the_batch_with_it():
+    """One request's fault costs one request. The blast radius IS the contract.
+
+    A None token id means the runner could attribute the failure to a single row
+    -- a bad sampling param, NaN logits in one row. Failing the batch there
+    would let any one client take out the seven strangers sharing its forward
+    pass, which is how {"top_k": "5"} used to kill the whole server. Contrast
+    test_a_dying_tick_fails_every_request_instead_of_hanging: a raise means the
+    runner could NOT attribute it, and then everybody does go down.
+    """
+    scheduler = Scheduler(max_batch_size=4, max_batch_tokens=1000)
+    doomed, bystander = seq(max_new_tokens=2), seq(max_new_tokens=2)
+
+    class OneBadRow(FakeRunner):
+        # Keyed on the SEQUENCE, not the row index: once the casualty is
+        # dropped the bystander inherits row 0, and an index-keyed fake would
+        # then kill it too -- and call that a failure of the code under test.
+        def execute(self, batch):
+            self.calls.append(batch)
+            return [None if s.id == doomed.id else 7 for s in batch.seqs]
+
+    scheduler.add(doomed)
+    scheduler.add(bystander)
+
+    task = asyncio.create_task(run_loop(OneBadRow(), scheduler))
+    await asyncio.sleep(0.05)
+
+    assert doomed.finish_reason == "error"
+    assert await asyncio.wait_for(doomed.queue.get(), timeout=1) is None
+    assert bystander.finish_reason == "length", "a bystander lost its request"
+    assert bystander.output_ids == [7, 7]
+    assert not task.done(), "the loop must survive a single row's failure"
+
+    task.cancel()
+
+
+@pytest.mark.anyio
+async def test_a_failed_row_forces_a_prefill_on_the_next_tick():
+    """Dropping a row invalidates the cache: it is indexed by row POSITION.
+
+    Keep decoding after a casualty and every surviving row reads another
+    sequence's KV entries -- fluent output, wrong context, no error anywhere.
+    """
+    class FirstTickHasACasualty(FakeRunner):
+        def execute(self, batch):
+            self.calls.append(batch)
+            first_tick = len(self.calls) == 1
+            return [None if (first_tick and i == 0) else 7
+                    for i in range(len(batch.seqs))]
+
+    scheduler = Scheduler(max_batch_size=4, max_batch_tokens=1000)
+    scheduler.add(seq(max_new_tokens=1))
+    scheduler.add(seq(max_new_tokens=3))
+
+    runner = FirstTickHasACasualty()
+    task = asyncio.create_task(run_loop(runner, scheduler))
+    await asyncio.sleep(0.05)
+    task.cancel()
+
+    assert [c.is_prefill for c in runner.calls[:2]] == [True, True]
+
+
+@pytest.mark.anyio
 async def test_ragged_batch_runs_to_completion():
     runner = FakeRunner(script=lambda call, row: (row + 1) * 3 + call)
     scheduler = Scheduler(max_batch_size=4, max_batch_tokens=1000)

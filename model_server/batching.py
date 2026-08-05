@@ -265,7 +265,21 @@ async def run_loop(runner, scheduler: Scheduler, idle_sleep: float = 0.005):
             scheduler.fail_all(exc)
             raise
 
-        scheduler.postprocess(batch, next_ids)
+        # A row that came back None failed on its own -- a bad sampling param, a
+        # NaN in one row's logits -- and only that request is lost. Aborting it
+        # here rather than letting the runner raise is what keeps the blast
+        # radius at one request instead of the whole batch; the runner still
+        # raises for failures that belong to everybody (see QwenRunner._sample).
+        casualties = [s for s, token in zip(batch, next_ids) if token is None]
+        for seq in casualties:
+            scheduler.abort(seq, "error")
+
+        survivors = [(s, t) for s, t in zip(batch, next_ids) if t is not None]
+        scheduler.postprocess([s for s, _ in survivors], [t for _, t in survivors])
+
+        # `current` still names the casualty, so the next tick sees a membership
+        # change and prefills. It must: the runner's cache is indexed by row
+        # position and still holds a row for the request just dropped.
         members = current
 
 

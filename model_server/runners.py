@@ -18,11 +18,14 @@ torch is imported per-runner, not at module scope: MockRunner has to work in the
 ~150MB image that has no torch in it at all.
 """
 
+import logging
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 from batching import Sequence
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -54,8 +57,13 @@ class ModelRunner(ABC):
         """Token ids -> text, with special tokens stripped."""
 
     @abstractmethod
-    def execute(self, batch: ForwardBatch) -> list[int]:
-        """Advance every sequence by one token. Returns one token id per row."""
+    def execute(self, batch: ForwardBatch) -> list[int | None]:
+        """Advance every sequence by one token. Returns one token id per row.
+
+        None in a row means "this row alone failed": run_loop aborts that
+        sequence and keeps the batch running. Raise instead when the failure is
+        the batch's -- an OOM, a dead device -- and every row goes down with it.
+        """
 
     def reset(self) -> None:
         """Drop any cached execution state. Called when the loop goes idle."""
@@ -156,31 +164,56 @@ class QwenRunner(ModelRunner):
         position_ids = (attention_mask.cumsum(-1) - 1).clamp(min=0)
         return input_ids, attention_mask, position_ids
 
-    def _sample(self, logits, seqs: list[Sequence]) -> list[int]:
+    def _sample_row(self, row_logits, s: Sequence) -> int:
+        import torch
+
+        if s.temperature <= 0:
+            return int(torch.argmax(row_logits))
+
+        scaled = row_logits / s.temperature
+        if s.top_k and s.top_k > 0:  # None / 0 / negative all mean "unset"
+            k = min(s.top_k, scaled.size(-1))
+            kept, _ = torch.topk(scaled, k)
+            scaled = scaled.masked_fill(scaled < kept[-1], float("-inf"))
+
+        probs = torch.softmax(scaled, dim=-1)
+        return int(torch.multinomial(probs, 1))
+
+    def _sample(self, logits, seqs: list[Sequence]) -> list[int | None]:
         """One token per row, honouring each row's OWN temperature and top_k.
 
         Rows are different HTTP requests that happened to share a forward pass, so
         a single vectorised softmax over the batch would apply one row's sampling
         config to all of them. A per-row Python loop costs microseconds against a
         forward pass of milliseconds.
+
+        That per-row loop is also the one place in a tick where a failure can be
+        ATTRIBUTED. A forward pass either works for everyone or for no one, but
+        sampling row 3 touches only row 3 -- so a row that raises comes back as
+        None and takes only its own request down (run_loop aborts it), instead of
+        failing the batch it happened to share. This is SGLang's
+        set_finish_with_abort placed where attribution is unambiguous.
+
+        The OOM re-raise is the exception to that, and it is not a formality:
+        after a CUDA OOM the allocator is in an unknown state, so continuing to
+        serve the other seven rows would produce wrong output rather than an
+        outage. That one really is everybody's problem -- vLLM calls it
+        EngineDeadError -- and it must stay fatal.
         """
         import torch
 
-        picked = []
+        picked: list[int | None] = []
         for row, s in enumerate(seqs):
-            row_logits = logits[row]
-            if s.temperature <= 0:
-                picked.append(int(torch.argmax(row_logits)))
-                continue
-
-            scaled = row_logits / s.temperature
-            if s.top_k and s.top_k > 0:  # None / 0 / negative all mean "unset"
-                k = min(s.top_k, scaled.size(-1))
-                kept, _ = torch.topk(scaled, k)
-                scaled = scaled.masked_fill(scaled < kept[-1], float("-inf"))
-
-            probs = torch.softmax(scaled, dim=-1)
-            picked.append(int(torch.multinomial(probs, 1)))
+            try:
+                picked.append(self._sample_row(logits[row], s))
+            except torch.cuda.OutOfMemoryError:
+                raise
+            except Exception:
+                # Logged, not swallowed: an unexplained 500 with nothing in the
+                # pod logs is the failure this codebase complains about
+                # elsewhere, and a per-row abort is invisible in /metrics.
+                log.exception("sampling failed for sequence %s; aborting that row", s.id)
+                picked.append(None)
 
         return picked
 
