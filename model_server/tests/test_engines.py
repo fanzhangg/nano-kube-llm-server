@@ -13,7 +13,7 @@ import asyncio
 import pytest
 
 from batching import Scheduler
-from engines import BatchingEngine, Completion
+from engines import BatchingEngine, Completion, StreamChunk
 
 # Two token ids that only decode to a character together -- a stand-in for the
 # CJK/emoji case where one character spans several BPE tokens.
@@ -153,7 +153,8 @@ async def test_generate_releases_the_slot_when_the_client_disconnects(engine):
 async def test_stream_yields_pieces_as_they_arrive(engine):
     loop = asyncio.create_task(drive(engine.scheduler, lambda s, t: 3 + t))
 
-    pieces = [p async for p in engine.stream("hi", 3, 0.0, None)]
+    chunks = [c async for c in engine.stream("hi", 3, 0.0, None)]
+    pieces = [c.text for c in chunks]
     await loop
 
     assert "".join(pieces) == letters(3, 4, 5)
@@ -161,10 +162,15 @@ async def test_stream_yields_pieces_as_they_arrive(engine):
 
 @pytest.mark.anyio
 async def test_stream_never_yields_an_empty_piece(engine):
-    """An empty SSE chunk is pure noise on the wire."""
+    """An empty SSE chunk is pure noise on the wire.
+
+    The terminal chunk is exempt and excluded here: it carries no text by
+    design, because what it carries is finish_reason.
+    """
     loop = asyncio.create_task(drive(engine.scheduler, lambda s, t: 3 + t))
 
-    pieces = [p async for p in engine.stream("hi", 3, 0.0, None)]
+    chunks = [c async for c in engine.stream("hi", 3, 0.0, None)]
+    pieces = [c.text for c in chunks[:-1]]
     await loop
 
     assert all(pieces)
@@ -176,7 +182,8 @@ async def test_stream_does_not_split_a_multi_token_character(engine):
     script = [PAIR_LEAD, PAIR_TAIL, 5]
     loop = asyncio.create_task(drive(engine.scheduler, lambda s, t: script[t]))
 
-    pieces = [p async for p in engine.stream("hi", 3, 0.0, None)]
+    chunks = [c async for c in engine.stream("hi", 3, 0.0, None)]
+    pieces = [c.text for c in chunks]
     await loop
 
     assert "".join(pieces) == PAIR_CHAR + letters(5)
@@ -184,10 +191,63 @@ async def test_stream_does_not_split_a_multi_token_character(engine):
 
 
 @pytest.mark.anyio
+async def test_only_the_last_chunk_carries_a_finish_reason(engine):
+    """A finish_reason mid-stream tells a client the response is over."""
+    loop = asyncio.create_task(drive(engine.scheduler, lambda s, t: 3 + t))
+
+    chunks = [c async for c in engine.stream("hi", 3, 0.0, None)]
+    await loop
+
+    assert all(c.finish_reason is None for c in chunks[:-1])
+    assert chunks[-1] == StreamChunk("", "length")
+
+
+@pytest.mark.anyio
+async def test_a_stream_ended_by_eos_says_stop_not_length(engine):
+    """The streaming half of test_generate_stops_on_eos_and_says_stop.
+
+    Both paths run the same Sequence through the same Scheduler, so they must
+    agree on why it ended. They did not: stream() yielded bare strings, the
+    reason died with the Sequence, and the HTTP layer hardcoded "length" on the
+    terminal chunk -- so an answer that finished on EOS reported itself as
+    truncated. Clients continue on "length", which turns a complete answer into
+    an unbounded continuation loop.
+    """
+    loop = asyncio.create_task(drive(engine.scheduler, lambda s, t: EOS if t else 5))
+
+    chunks = [c async for c in engine.stream("hi", 99, 0.0, None)]
+    await loop
+
+    assert chunks[-1].finish_reason == "stop"
+    assert "".join(c.text for c in chunks) == letters(5), "EOS must not reach the wire"
+
+
+@pytest.mark.anyio
+async def test_a_failed_loop_ends_the_stream_with_error(engine):
+    """fail_all's verdict must reach the HTTP layer, not be dressed up as an ending.
+
+    A dead run_loop marks every in-flight sequence "error". main.py turns that
+    into a broken stream with no [DONE]; what the engine owes it is the honest
+    reason rather than a plausible one.
+    """
+    stream = engine.stream("hi", 99, 0.0, None)
+    first = asyncio.create_task(stream.__anext__())
+    await asyncio.sleep(0)
+    engine.scheduler.schedule()
+    engine.scheduler.fail_all(RuntimeError("CUDA OOM"))
+
+    # No token was ever produced, so the terminal chunk is the ONLY chunk: a
+    # client that received nothing must still be told why it received nothing.
+    assert await first == StreamChunk("", "error")
+    await stream.aclose()
+    assert engine.scheduler.schedule() == []
+
+
+@pytest.mark.anyio
 async def test_stream_matches_generate_under_the_same_script(engine):
     """Two code paths, one answer -- the Milestone 3 property, preserved."""
     loop = asyncio.create_task(drive(engine.scheduler, lambda s, t: 3 + t))
-    streamed = "".join([p async for p in engine.stream("hi", 3, 0.0, None)])
+    streamed = "".join([c.text async for c in engine.stream("hi", 3, 0.0, None)])
     await loop
 
     engine.scheduler = Scheduler(max_batch_size=4, max_batch_tokens=1000)
