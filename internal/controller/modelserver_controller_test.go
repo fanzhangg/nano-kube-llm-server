@@ -354,6 +354,59 @@ var _ = Describe("ModelServer Controller", func() {
 			}))
 		})
 
+		It("gates liveness behind a startup probe so loading cannot crash-loop", func() {
+			// The three probes share /health but ask different questions, and the
+			// startup probe is what keeps that safe: 503 means "still loading"
+			// early and "the inference loop died" later, and only the ordering
+			// tells them apart. Without the startup probe, a liveness probe
+			// restarts the pod partway through loading weights -- then restarts
+			// that -- and a slow model never comes up at all.
+			var deploy appsv1.Deployment
+			Expect(k8sClient.Get(ctx, typeNamespacedName, &deploy)).To(Succeed())
+			container := deploy.Spec.Template.Spec.Containers[0]
+
+			Expect(container.StartupProbe).NotTo(BeNil(),
+				"a liveness probe without a startup probe would kill slow model loads")
+			Expect(container.LivenessProbe).NotTo(BeNil())
+			Expect(container.ReadinessProbe).NotTo(BeNil())
+
+			for _, probe := range []*corev1.Probe{
+				container.StartupProbe, container.LivenessProbe, container.ReadinessProbe,
+			} {
+				Expect(probe.HTTPGet.Path).To(Equal("/health"))
+				Expect(probe.HTTPGet.Port.IntValue()).To(Equal(8000))
+			}
+
+			// The load budget has to outlast a real model load; anything tighter
+			// turns a cold start into a CrashLoopBackOff.
+			budget := container.StartupProbe.PeriodSeconds * container.StartupProbe.FailureThreshold
+			Expect(budget).To(BeNumerically(">=", 300),
+				"startup budget is under five minutes; weights take longer than that")
+
+			// Liveness must NOT also be lenient: once startup has succeeded, a
+			// 503 can only mean the loop is gone, and every second of delay is a
+			// second of a pod answering nothing.
+			Expect(container.LivenessProbe.PeriodSeconds).To(BeNumerically("<=", 15))
+			Expect(container.LivenessProbe.FailureThreshold).To(BeNumerically("<=", 5))
+		})
+
+		It("restores the probes after they are edited away", func() {
+			// Drift here is invisible in `kubectl get pods` -- the pod stays
+			// Running -- and it silently removes the only mechanism that
+			// recovers a dead inference loop.
+			var deploy appsv1.Deployment
+			Expect(k8sClient.Get(ctx, typeNamespacedName, &deploy)).To(Succeed())
+			deploy.Spec.Template.Spec.Containers[0].LivenessProbe = nil
+			deploy.Spec.Template.Spec.Containers[0].StartupProbe = nil
+			Expect(k8sClient.Update(ctx, &deploy)).To(Succeed())
+
+			reconcileOnce()
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, &deploy)).To(Succeed())
+			Expect(deploy.Spec.Template.Spec.Containers[0].LivenessProbe).NotTo(BeNil())
+			Expect(deploy.Spec.Template.Spec.Containers[0].StartupProbe).NotTo(BeNil())
+		})
+
 		It("re-applies MAX_BATCH_SIZE after it is edited away", func() {
 			// Capacity is decided at process start, so changing it necessarily
 			// restarts pods -- which makes drift here silently halve throughput

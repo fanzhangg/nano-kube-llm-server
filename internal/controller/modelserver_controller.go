@@ -237,11 +237,46 @@ func (r *ModelServerReconciler) buildDeployment(ms *servingv1alpha1.ModelServer)
 			corev1ac.EnvVar().WithName("MODEL_NAME").WithValue(ms.Spec.Model),
 			corev1ac.EnvVar().WithName("MAX_BATCH_SIZE").WithValue(strconv.Itoa(int(ms.Spec.MaxBatchSize))),
 		).
+		// Three probes, one endpoint, three different questions. /health answers
+		// 503 while the model is loading AND 503 once the inference loop has
+		// died; which of those a 503 means depends only on WHEN it is asked,
+		// and that is exactly what the probe split encodes.
+		//
+		// The startup probe is what makes a liveness probe safe here. Loading
+		// weights takes tens of seconds for a 0.6B and minutes for anything
+		// larger, and a liveness probe on its own cannot tell "still loading"
+		// from "wedged" -- it would restart the pod mid-load, then restart the
+		// restart, which is the classic way to turn a slow start into a
+		// CrashLoopBackOff. Kubernetes disables liveness and readiness until the
+		// startup probe first succeeds, so the whole load window is protected.
+		//
+		// 120 x 5s = a 10 minute budget. A pod that cannot load in ten minutes
+		// now crash-loops instead of sitting in Loading forever with nothing in
+		// status to explain it -- a wrong spec.model used to fail exactly that
+		// silently.
+		WithStartupProbe(corev1ac.Probe().
+			WithHTTPGet(corev1ac.HTTPGetAction().
+				WithPath("/health").
+				WithPort(intstr.FromInt(8000))).
+			WithPeriodSeconds(5).
+			WithFailureThreshold(120)).
+		// After startup succeeds, `loaded` is true for the life of the process
+		// and never flips back -- so from here on a 503 can only mean the run
+		// loop is gone. That is unrecoverable in-process (see run_loop: after a
+		// CUDA OOM the allocator state is unknown), and a restart is the whole
+		// remedy run_loop's docstring promises. ~30s to notice.
+		WithLivenessProbe(corev1ac.Probe().
+			WithHTTPGet(corev1ac.HTTPGetAction().
+				WithPath("/health").
+				WithPort(intstr.FromInt(8000))).
+			WithPeriodSeconds(10).
+			WithFailureThreshold(3)).
+		// No InitialDelaySeconds: the startup probe already gates this one, so a
+		// delay here would only postpone the first check after loading finished.
 		WithReadinessProbe(corev1ac.Probe().
 			WithHTTPGet(corev1ac.HTTPGetAction().
 				WithPath("/health").
 				WithPort(intstr.FromInt(8000))).
-			WithInitialDelaySeconds(5).
 			WithPeriodSeconds(3))
 
 	// Only set resources when GPUs are actually requested: an empty ResourceList
