@@ -19,3 +19,4 @@ spec:
   # operator implements behaves identically. Set to 1 on a cluster running the
   # NVIDIA device plugin.
   gpus: 0
+  maxBatchSize: 16

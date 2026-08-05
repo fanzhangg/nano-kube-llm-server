@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strconv"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -234,6 +235,7 @@ func (r *ModelServerReconciler) buildDeployment(ms *servingv1alpha1.ModelServer)
 		WithEnv(
 			corev1ac.EnvVar().WithName("MODEL_ID").WithValue(ms.Spec.Model),
 			corev1ac.EnvVar().WithName("MODEL_NAME").WithValue(ms.Spec.Model),
+			corev1ac.EnvVar().WithName("MAX_BATCH_SIZE").WithValue(strconv.Itoa(int(ms.Spec.MaxBatchSize))),
 		).
 		WithReadinessProbe(corev1ac.Probe().
 			WithHTTPGet(corev1ac.HTTPGetAction().

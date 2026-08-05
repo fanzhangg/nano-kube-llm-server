@@ -54,6 +54,18 @@ type ModelServerSpec struct {
 	// +kubebuilder:validation:Minimum=0
 	// +optional
 	GPUs int32 `json:"gpus,omitempty"`
+
+	// maxBatchSize is how many sequences the scheduler may run concurrently. This is
+	// the real KV-cache capacity limit, and it is what decides whether an arriving
+	// request starts or queues -- which is what makes vllm:num_requests_waiting a
+	// measurement rather than a number the server invented.
+	//
+	// Set it too high and you OOM the GPU; too low and you leave throughput on the
+	// table. It is the one knob this CRD exposes that trades memory for throughput.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=8
+	// +optional
+	MaxBatchSize int32 `json:"maxBatchSize,omitempty"`
 }
 
 // ModelServerStatus defines the observed state of ModelServer.

@@ -61,6 +61,19 @@ spec:
               image:
                 default: modelserver-mock:latest
                 type: string
+              maxBatchSize:
+                default: 8
+                description: |-
+                  maxBatchSize is how many sequences the scheduler may run concurrently. This is
+                  the real KV-cache capacity limit, and it is what decides whether an arriving
+                  request starts or queues -- which is what makes vllm:num_requests_waiting a
+                  measurement rather than a number the server invented.
+
+                  Set it too high and you OOM the GPU; too low and you leave throughput on the
+                  table. It is the one knob this CRD exposes that trades memory for throughput.
+                format: int32
+                minimum: 1
+                type: integer
               model:
                 description: |-
                   model is the HuggingFace repo id to serve, e.g. "Qwen/Qwen3-0.6B". It is

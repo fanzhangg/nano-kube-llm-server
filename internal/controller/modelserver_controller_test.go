@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strconv"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -331,6 +332,45 @@ var _ = Describe("ModelServer Controller", func() {
 
 			Expect(k8sClient.Get(ctx, typeNamespacedName, &deploy)).To(Succeed())
 			Expect(deploy.Spec.Template.Spec.Containers[0].Image).To(Equal(original))
+		})
+
+		It("passes the scheduler capacity through to the pod", func() {
+			// This is the last link in the autoscaling chain:
+			//   spec.maxBatchSize -> MAX_BATCH_SIZE -> Scheduler capacity
+			//   -> a full batch queues -> num_requests_waiting > 0 -> HPA scales.
+			// Without it the capacity is whatever the image defaults to, and any
+			// threshold tuned against that metric is tuned against a constant.
+			var ms servingv1alpha1.ModelServer
+			Expect(k8sClient.Get(ctx, typeNamespacedName, &ms)).To(Succeed())
+			Expect(ms.Spec.MaxBatchSize).To(BeNumerically(">", 0),
+				"the CRD default must apply when the CR omits maxBatchSize")
+
+			var deploy appsv1.Deployment
+			Expect(k8sClient.Get(ctx, typeNamespacedName, &deploy)).To(Succeed())
+
+			Expect(deploy.Spec.Template.Spec.Containers[0].Env).To(ContainElement(corev1.EnvVar{
+				Name:  "MAX_BATCH_SIZE",
+				Value: strconv.Itoa(int(ms.Spec.MaxBatchSize)),
+			}))
+		})
+
+		It("re-applies MAX_BATCH_SIZE after it is edited away", func() {
+			// Capacity is decided at process start, so changing it necessarily
+			// restarts pods -- which makes drift here silently halve throughput
+			// until the next unrelated rollout.
+			var deploy appsv1.Deployment
+			Expect(k8sClient.Get(ctx, typeNamespacedName, &deploy)).To(Succeed())
+			original := deploy.Spec.Template.Spec.Containers[0].Env
+
+			deploy.Spec.Template.Spec.Containers[0].Env = []corev1.EnvVar{
+				{Name: "MAX_BATCH_SIZE", Value: "1"},
+			}
+			Expect(k8sClient.Update(ctx, &deploy)).To(Succeed())
+
+			reconcileOnce()
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, &deploy)).To(Succeed())
+			Expect(deploy.Spec.Template.Spec.Containers[0].Env).To(ConsistOf(original))
 		})
 	})
 })
