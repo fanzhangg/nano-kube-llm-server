@@ -11,7 +11,7 @@ spec:
   # instead of falling back to the mock engine.
   model: "Qwen/Qwen3-0.6B"
   replicas: 1
-  # Built from model_server/Dockerfile.qwen -- weights are baked in, so the pod
+  # Built from model_server/docker/Dockerfile.qwen -- weights are baked in, so the pod
   # needs no network access and the Loading phase is real model loading rather
   # than a download.
   image: "modelserver-qwen:latest"

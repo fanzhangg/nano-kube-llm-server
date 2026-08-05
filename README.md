@@ -109,7 +109,7 @@ In another terminal, build the serving image and load it into the cluster. Qwen3
 
 ```bash
 cd model_server
-docker build -f Dockerfile.qwen -t modelserver-qwen:latest .   # CPU build, ~2.7GB
+docker build -f docker/Dockerfile.qwen -t modelserver-qwen:latest .   # CPU build, ~2.7GB
 kind load docker-image modelserver-qwen:latest --name nano-kube-llm
 ```
 
@@ -143,7 +143,7 @@ Add `"stream": true` for server-sent events. On CPU expect single-digit tokens/s
 
 ### On a GPU cluster
 
-Build `Dockerfile.qwen-gpu` instead and set `gpus: 1` on the CR. The node needs an NVIDIA driver, the container toolkit, and the device plugin DaemonSet; the image carries everything above the driver.
+Build `docker/Dockerfile.qwen-gpu` instead and set `gpus: 1` on the CR. The node needs an NVIDIA driver, the container toolkit, and the device plugin DaemonSet; the image carries everything above the driver.
 
 ### Without a model
 
