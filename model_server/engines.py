@@ -33,6 +33,26 @@ class Completion:
     finish_reason: str = "length"
 
 
+@dataclass
+class StreamChunk:
+    """One chunk of a streaming response: new text, or the reason it ended.
+
+    `finish_reason` is None on every text chunk and set on exactly one terminal
+    chunk that carries no text -- the shape OpenAI puts on the wire.
+
+    It exists because only the scheduler knows WHY a sequence ended, and while
+    stream() yielded bare strings that knowledge died with the Sequence. The
+    HTTP layer, having nothing to forward, hardcoded "length" on the last chunk:
+    every stream claimed it had been truncated, including the ones that stopped
+    on EOS. Clients treat "length" as "ask for more", so a correct, finished
+    answer read as an invitation to keep generating -- and the two-stop-token
+    care in QwenRunner._resolve_eos_ids was invisible on the streaming path.
+    """
+
+    text: str
+    finish_reason: str | None = None
+
+
 class BatchingEngine:
     """Submits a Sequence, then reads that sequence's queue. That is all.
 
@@ -102,8 +122,17 @@ class BatchingEngine:
                 # produces no yield that round and appears once complete.
                 text = self.runner.decode(seq.output_ids)
                 if len(text) > sent:
-                    yield text[sent:]
+                    yield StreamChunk(text[sent:])
                     sent = len(text)
+            # Reached only after the sentinel, and postprocess sets finish_reason
+            # BEFORE emitting it -- so this read is ordered, not racy.
+            #
+            # INSIDE the try, deliberately. On disconnect GeneratorExit lands on
+            # the await above, the finally runs, and the exception propagates --
+            # this yield is skipped, which is right: nobody is listening. Moved
+            # below the finally it would run during teardown instead, and
+            # "async generator ignored GeneratorExit" surfaces as a hung stream.
+            yield StreamChunk("", seq.finish_reason)
         finally:
             # Streaming clients are the ones that hang up early.
             self.cancel(seq)

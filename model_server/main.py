@@ -36,6 +36,13 @@ from runners import MockRunner
 # /health on 503 forever with nothing in the logs to explain it.
 MOCK_MODEL_PREFIX = "mock/"
 
+# Reasons a sequence can end that are NOT an OpenAI finish_reason. The schema
+# admits "stop", "length", "content_filter" and "tool_calls" only, so passing
+# these through would put a value on the wire that a strict client rejects while
+# parsing -- and would dress a dead run_loop up as a completed answer.
+# "cancelled" is here for completeness; it means the client already left.
+FATAL_FINISH_REASONS = {"error", "cancelled"}
+
 
 @dataclass
 class Settings:
@@ -170,8 +177,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return f"data: {json.dumps(payload)}\n\n"
 
         async for piece in app.state.engine.stream(prompt, max_tokens, temperature, top_k):
-            yield chunk(piece, None)
-        yield chunk("", "length")
+            if piece.finish_reason in FATAL_FINISH_REASONS:
+                # No [DONE], and the response body stops mid-stream. That IS the
+                # error signal: the SSE framing has no error event, and the
+                # status line went out with the first chunk, so a 500 is no
+                # longer available. Reporting a normal finish_reason here would
+                # hand the client a truncated answer it believes is complete.
+                raise RuntimeError(f"generation failed: {piece.finish_reason}")
+            yield chunk(piece.text, piece.finish_reason)
         yield "data: [DONE]\n\n"
 
     @app.get("/metrics")
